@@ -280,16 +280,19 @@ function isDate_(v) {
   return Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime());
 }
 
+/**
+ * Полночь даты в часовом поясе таблицы. Пояс скрипта не используем: если он отличается
+ * от пояса таблицы, дата в ячейке съезжает на день.
+ */
 function parseYmd_(s) {
   if (isDate_(s)) return new Date(s.getTime());
-  const [y, m, d] = String(s).split('-').map(Number);
-  return new Date(y, m - 1, d);
+  return Utilities.parseDate(String(s), SpreadsheetApp.getActive().getSpreadsheetTimeZone(), 'yyyy-MM-dd');
 }
 
+/** Арифметика над строкой ГГГГ-ММ-ДД, без часовых поясов. */
 function addDays_(s, n) {
-  const d = parseYmd_(s);
-  d.setDate(d.getDate() + n);
-  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const [y, m, d] = String(s).split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
 }
 
 function num_(v) {
@@ -307,7 +310,7 @@ function debugSnapshot() {
 /** Добавляет, меняет и удаляет тестовую запись. В таблице после выполнения ничего не остаётся. */
 function debugWriteCycle() {
   const id = 'test-' + Date.now();
-  const today = ymd_(new Date(), Session.getScriptTimeZone());
+  const today = ymd_(new Date(), SpreadsheetApp.getActive().getSpreadsheetTimeZone());
   Logger.log(addTx_({ id: id, date: today, amount: 1, category: 'Прочие', account: 'Наличные', who: 'Егор', comment: 'тест' }));
   Logger.log(addTx_({ id: id, date: today, amount: 1, category: 'Прочие' })); // должен вернуть duplicate
   Logger.log(updateTx_(id, { amount: 2, comment: 'тест изменён' }));

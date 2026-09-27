@@ -17,6 +17,7 @@ const state = {
   category: '',
   plan: false,
   editing: null,                       // запись, которую сейчас меняем
+  fromPlan: false,                     // ввод открыт тапом по ожидаемой позиции
   showAllRecent: false,
 };
 
@@ -48,6 +49,25 @@ function uid() {
 function show(id) {
   for (const s of document.querySelectorAll('.screen')) s.hidden = s.id !== id;
 }
+
+/**
+ * Своя история переходов, чтобы жест «назад» на телефоне возвращал по экранам,
+ * а не закрывал приложение. Корень — экран ввода; с него «назад» выходит.
+ * sub: экран ввода, открытый из сводки (изменение записи или оплата ожидаемой позиции).
+ */
+function go(screen, sub) {
+  history.pushState({ screen: screen, sub: !!sub }, '');
+  show(screen);
+}
+function currentNav() { return history.state || { screen: 'entry' }; }
+
+window.addEventListener('popstate', (e) => {
+  const s = e.state || { screen: 'entry' };
+  $('cat-sheet').hidden = true;
+  if (!s.sub && (state.editing || state.fromPlan)) resetEntry();   // ушли из режима правки без сохранения
+  show(s.screen);
+  if (s.screen === 'summary') renderSummary();
+});
 
 let toastTimer;
 function toast(msg) {
@@ -227,19 +247,20 @@ function save() {
       enqueue({ op: 'update', id: id, fields: fields });
     }
     toast(`Изменено: ${money(amount)} · ${fields.category}`);
-    state.editing = null;
-    show('summary');
   } else {
     const tx = Object.assign({ id: uid(), who: state.who }, fields);
     LS.set('lastAccount', tx.account);
     enqueue({ op: 'add', tx: tx, at: Date.now() });
     toast(`${tx.status === 'План' ? 'В план' : 'Записано'}: ${money(amount)} · ${tx.category}`);
   }
+  const back = currentNav().sub;
   resetEntry();
+  if (back) history.back();
 }
 
 function resetEntry() {
   state.editing = null;
+  state.fromPlan = false;
   state.amount = '';
   state.category = '';
   state.plan = false;
@@ -259,7 +280,7 @@ function startEdit(t) {
   $('comment').value = t.comment || '';
   $('date').value = t.date;
   if (t.account && [...$('account').options].some((o) => o.value === t.account)) $('account').value = t.account;
-  show('entry');
+  go('entry', true);
   renderEntry();
 }
 
@@ -297,8 +318,13 @@ function openCategorySheet() {
     renderEntry();
   });
   $('cat-sheet').hidden = false;
+  history.pushState(Object.assign({}, currentNav(), { sheet: true }), '');
 }
-function closeSheet() { $('cat-sheet').hidden = true; }
+function closeSheet() {
+  if ($('cat-sheet').hidden) return;
+  if (currentNav().sheet) history.back();   // popstate сам закроет лист
+  else $('cat-sheet').hidden = true;
+}
 
 // ---------- сводка ----------
 function renderStamp(offline) {
@@ -314,6 +340,8 @@ function renderStamp(offline) {
 /** Неотправленные траты сразу уменьшают «остаток на сегодня», чтобы цифра не врала оффлайн. */
 function pendingSpendToday() {
   const t = todayYmd();
+  const start = state.snap && state.snap.summary && state.snap.summary.periodStart;
+  if (start && t < start) return 0;   // сегодня ещё не в периоде — на остаток не влияет
   return state.queue
     .filter((q) => q.op === 'add' && q.tx.status === 'Факт' && q.tx.type === 'Расход' && q.tx.date === t)
     .reduce((s, q) => s + q.tx.amount, 0);
@@ -336,44 +364,59 @@ function renderSummary() {
   renderRecent();
 }
 
-/**
- * Ожидаемые: разовые платежи — отдельными строками; то, что повторяется
- * 4+ раза за окно (такси, транспорт), — одной строкой на категорию.
- */
+const WEEKDAYS = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
+function dayTitle(ymd) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const wd = WEEKDAYS[new Date(y, m - 1, d).getDay()];
+  const t = new Date(); const today = todayYmd();
+  t.setDate(t.getDate() + 1);
+  const tomorrow = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+  const name = ymd === today ? 'Сегодня' : ymd === tomorrow ? 'Завтра' : '';
+  return (name ? name + ' · ' : '') + `${wd} ${shortDate(ymd)}`;
+}
+
+/** Ожидаемые по дням: заголовок дня с итогом, под ним позиции. Просроченные — отдельным блоком сверху. */
 function renderExpected() {
   const ul = $('expected');
   ul.innerHTML = '';
-  const items = (state.snap && state.snap.expected) || [];
-  const byCat = {};
-  items.forEach((it) => { (byCat[it.category] = byCat[it.category] || []).push(it); });
-  const rows = [];
-  for (const cat in byCat) {
-    const list = byCat[cat];
-    if (list.length >= 4) {
-      rows.push({
-        date: list[0].date, category: cat, type: list[0].type, left: list.reduce((s, x) => s + x.left, 0),
-        note: `${list.length} раз, до ${shortDate(list[list.length - 1].date)}`, overdue: list[0].overdue, group: true,
-      });
-    } else {
-      list.forEach((x) => rows.push(Object.assign({}, x, { note: x.left < x.amount ? `осталось из ${money(x.amount)}` : '' })));
-    }
-  }
-  rows.sort((a, b) => a.date.localeCompare(b.date));
-  if (!rows.length) return emptyRow(ul, 'Ничего не ожидается');
+  const items = ((state.snap && state.snap.expected) || []).slice().sort((a, b) => a.date.localeCompare(b.date));
+  if (!items.length) return emptyRow(ul, 'Ничего не ожидается');
 
-  for (const r of rows) {
-    const li = document.createElement('li');
-    li.className = 'tap' + (r.overdue ? ' overdue' : '');
-    li.innerHTML = `<span class="when"></span><span class="what"><span></span><small></small></span><span class="sum"></span>`;
-    li.querySelector('.when').textContent = r.group ? 'с ' + shortDate(r.date) : shortDate(r.date);
-    li.querySelector('.what span').textContent = r.category;
-    li.querySelector('.what small').textContent = r.note || (r.overdue ? 'просрочено' : '');
-    const sum = li.querySelector('.sum');
-    sum.textContent = (r.type === 'Доход' ? '+' : '') + money(r.left);
-    sum.classList.toggle('income', r.type === 'Доход');
-    // Тап по разовой позиции — подставить её в ввод как оплаченную сегодня.
-    if (!r.group) li.onclick = () => prefillFromPlan(r);
-    ul.appendChild(li);
+  const groups = [];
+  const today = todayYmd();
+  for (const it of items) {
+    const key = it.date < today ? 'overdue' : it.date;
+    let g = groups[groups.length - 1];
+    if (!g || g.key !== key) groups.push(g = { key: key, items: [] });
+    g.items.push(it);
+  }
+
+  for (const g of groups) {
+    const out = g.items.filter((x) => x.type !== 'Доход').reduce((s, x) => s + x.left, 0);
+    const inc = g.items.filter((x) => x.type === 'Доход').reduce((s, x) => s + x.left, 0);
+    const head = document.createElement('li');
+    head.className = 'day' + (g.key === 'overdue' ? ' overdue' : '') + (g.key === today ? ' is-today' : '');
+    head.innerHTML = '<span class="what"></span><span class="sum"></span>';
+    head.querySelector('.what').textContent = g.key === 'overdue' ? 'Просрочено' : dayTitle(g.key);
+    head.querySelector('.sum').textContent = [out ? money(out) : '', inc ? '+' + money(inc) : ''].filter(Boolean).join(' · ');
+    ul.appendChild(head);
+
+    for (const r of g.items) {
+      const li = document.createElement('li');
+      li.className = 'tap item';
+      li.innerHTML = '<span class="what"><span></span><small></small></span><span class="sum"></span>';
+      li.querySelector('.what span').textContent = r.category;
+      const notes = [];
+      if (g.key === 'overdue') notes.push(shortDate(r.date));
+      if (r.left < r.amount) notes.push(`осталось из ${money(r.amount)}`);
+      li.querySelector('.what small').textContent = notes.join(' · ');
+      const sum = li.querySelector('.sum');
+      sum.textContent = (r.type === 'Доход' ? '+' : '') + money(r.left);
+      sum.classList.toggle('income', r.type === 'Доход');
+      // Тап — подставить позицию в ввод как оплаченную сегодня.
+      li.onclick = () => prefillFromPlan(r);
+      ul.appendChild(li);
+    }
   }
 }
 
@@ -383,8 +426,9 @@ function prefillFromPlan(p) {
   state.category = p.category;
   state.amount = String(p.left);
   state.plan = false;
+  state.fromPlan = true;
   $('date').value = todayYmd();
-  show('entry');
+  go('entry', true);
   renderEntry();
 }
 
@@ -451,7 +495,7 @@ function openSetup(first) {
   for (const b of $('setup-who').children) b.classList.toggle('on', b.dataset.v === state.who);
   $('setup-cancel').hidden = first;
   $('setup-err').hidden = true;
-  show('setup');
+  if (first) show('setup'); else go('setup');
 }
 
 async function saveSetup() {
@@ -470,7 +514,7 @@ async function saveSetup() {
     state.who = whoBtn.dataset.v;
     LS.set('who', state.who);
     applySnap(j);
-    show('entry');
+    if (currentNav().screen === 'setup') history.back(); else show('entry');
     flush();
   } catch (e) {
     state.url = prev;
@@ -501,17 +545,20 @@ function bind() {
   $('date').addEventListener('change', renderEntry);
   $('comment').addEventListener('keydown', (e) => { if (e.key === 'Enter') e.target.blur(); });
   $('save').onclick = save;
-  $('edit-cancel').onclick = () => { resetEntry(); show('summary'); };
+  $('edit-cancel').onclick = () => history.back();
   $('recent-more').onclick = () => { state.showAllRecent = !state.showAllRecent; renderRecent(); };
-  $('today-chip').onclick = () => { if (state.editing) resetEntry(); show('summary'); renderSummary(); refresh(); };
-  $('back').onclick = () => show('entry');
+  $('today-chip').onclick = () => {
+    if (currentNav().sub) history.back(); else { go('summary'); renderSummary(); }
+    refresh();
+  };
+  $('back').onclick = () => history.back();
   $('settings').onclick = () => openSetup(false);
   $('setup-who').addEventListener('click', (e) => {
     if (!e.target.dataset.v) return;
     for (const b of $('setup-who').children) b.classList.toggle('on', b === e.target);
   });
   $('setup-save').onclick = saveSetup;
-  $('setup-cancel').onclick = () => show('entry');
+  $('setup-cancel').onclick = () => history.back();
   $('cat-sheet').addEventListener('click', (e) => { if (e.target.id === 'cat-sheet' || e.target.dataset.close != null) closeSheet(); });
 
   window.addEventListener('online', () => { flush(); refresh(); });
@@ -523,6 +570,7 @@ function bind() {
 
 // ---------- старт ----------
 bind();
+history.replaceState({ screen: 'entry' }, '');
 $('date').value = todayYmd();
 if (!state.url || !state.who) {
   openSetup(true);

@@ -157,6 +157,12 @@ h2 { font-size: 15px; color: var(--muted); font-weight: 600; margin: 14px 0 0; }
 .list button.del { border: 0; background: none; color: var(--muted); font-size: 18px; width: 36px; height: 36px; border-radius: 50%; flex: none; }
 .list button.del:active { background: var(--chip); color: var(--danger); }
 .list li.tap:active { background: var(--chip); }
+.list li.day { background: var(--chip); padding: 8px 14px; font-size: 14px; font-weight: 600; border-top: 0; }
+.list li.day .what { color: var(--muted); }
+.list li.day.is-today .what { color: var(--text); }
+.list li.day.overdue .what { color: var(--danger); }
+.list li.day .sum { color: var(--muted); font-weight: 600; }
+.list li.item { padding-left: 22px; }
 
 .hint { color: var(--muted); font-size: 13px; text-align: center; margin: 0; }
 #recent-more { width: 100%; }
