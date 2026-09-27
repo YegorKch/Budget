@@ -18,7 +18,6 @@ const state = {
   plan: false,
   editing: null,                       // запись, которую сейчас меняем
   fromPlan: false,                     // ввод открыт тапом по ожидаемой позиции
-  showAllRecent: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -360,8 +359,7 @@ function renderSummary() {
   set('s-balance', sm.balanceNow);
   $('s-days').textContent = sm.daysLeft != null ? sm.daysLeft : '—';
   renderStamp();
-  renderExpected();
-  renderRecent();
+  renderDays();
 }
 
 const WEEKDAYS = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
@@ -375,93 +373,124 @@ function dayTitle(ymd) {
   return (name ? name + ' · ' : '') + `${wd} ${shortDate(ymd)}`;
 }
 
-/** Ожидаемые по дням: заголовок дня с итогом, под ним позиции. Просроченные — отдельным блоком сверху. */
-function renderExpected() {
-  const ul = $('expected');
-  ul.innerHTML = '';
-  const items = ((state.snap && state.snap.expected) || []).slice().sort((a, b) => a.date.localeCompare(b.date));
-  if (!items.length) return emptyRow(ul, 'Ничего не ожидается');
+/**
+ * Планы и факты с учётом неотправленных правок из очереди.
+ * Нет feed (старая версия Apps Script) — собираем из expected/recent.
+ */
+function feedData() {
+  const snap = state.snap || {};
+  const f = snap.feed || {
+    plans: (snap.expected || []).map((x) => Object.assign({}, x, { amount: x.left })),
+    facts: snap.recent || [],
+  };
+  const deleting = new Set(state.queue.filter((q) => q.op === 'delete').map((q) => q.id));
+  const updates = {};
+  state.queue.filter((q) => q.op === 'update').forEach((q) => { updates[q.id] = Object.assign(updates[q.id] || {}, q.fields); });
+  const plans = [];
+  const facts = [];
+  const put = (t) => ((t.status || 'Факт') === 'План' ? plans : facts).push(t);
+  f.plans.forEach((t) => { if (!deleting.has(t.id)) put(Object.assign({ status: 'План' }, t, updates[t.id] || {}, updates[t.id] ? { pending: true } : {})); });
+  f.facts.forEach((t) => { if (!deleting.has(t.id)) put(Object.assign({ status: 'Факт' }, t, updates[t.id] || {}, updates[t.id] ? { pending: true } : {})); });
+  state.queue.filter((q) => q.op === 'add').forEach((q) => put(Object.assign({ pending: true }, q.tx)));
+  return { plans: plans, facts: facts };
+}
 
-  const groups = [];
+/**
+ * Лента по дням: сегодня сверху, дальше будущие дни, прошедшие — ниже.
+ * В дне: планы, разделитель, факты, остаток плана (план расходов − факт расходов за день).
+ */
+function renderDays() {
+  const box = $('days');
+  box.innerHTML = '';
+  const { plans, facts } = feedData();
   const today = todayYmd();
-  for (const it of items) {
-    const key = it.date < today ? 'overdue' : it.date;
-    let g = groups[groups.length - 1];
-    if (!g || g.key !== key) groups.push(g = { key: key, items: [] });
-    g.items.push(it);
-  }
+  const days = {};
+  const day = (d) => (days[d] = days[d] || { plans: [], facts: [] });
+  plans.forEach((t) => day(t.date).plans.push(t));
+  facts.forEach((t) => day(t.date).facts.push(t));
+  day(today);
 
-  for (const g of groups) {
-    const out = g.items.filter((x) => x.type !== 'Доход').reduce((s, x) => s + x.left, 0);
-    const inc = g.items.filter((x) => x.type === 'Доход').reduce((s, x) => s + x.left, 0);
-    const head = document.createElement('li');
-    head.className = 'day' + (g.key === 'overdue' ? ' overdue' : '') + (g.key === today ? ' is-today' : '');
-    head.innerHTML = '<span class="what"></span><span class="sum"></span>';
-    head.querySelector('.what').textContent = g.key === 'overdue' ? 'Просрочено' : dayTitle(g.key);
-    head.querySelector('.sum').textContent = [out ? money(out) : '', inc ? '+' + money(inc) : ''].filter(Boolean).join(' · ');
-    ul.appendChild(head);
+  const dates = Object.keys(days);
+  const future = dates.filter((d) => d >= today).sort();
+  const past = dates.filter((d) => d < today).sort().reverse();
 
-    for (const r of g.items) {
-      const li = document.createElement('li');
-      li.className = 'tap item';
-      li.innerHTML = '<span class="what"><span></span><small></small></span><span class="sum"></span>';
-      li.querySelector('.what span').textContent = r.category;
-      const notes = [];
-      if (g.key === 'overdue') notes.push(shortDate(r.date));
-      if (r.left < r.amount) notes.push(`осталось из ${money(r.amount)}`);
-      li.querySelector('.what small').textContent = notes.join(' · ');
-      const sum = li.querySelector('.sum');
-      sum.textContent = (r.type === 'Доход' ? '+' : '') + money(r.left);
-      sum.classList.toggle('income', r.type === 'Доход');
-      // Тап — подставить позицию в ввод как оплаченную сегодня.
-      li.onclick = () => prefillFromPlan(r);
-      ul.appendChild(li);
-    }
+  future.forEach((d) => box.appendChild(dayCard(d, days[d])));
+  if (past.length) {
+    const h = document.createElement('h2');
+    h.textContent = 'Прошедшие дни';
+    box.appendChild(h);
+    past.forEach((d) => box.appendChild(dayCard(d, days[d])));
   }
 }
 
-function prefillFromPlan(p) {
+function dayCard(date, g) {
+  const ul = document.createElement('ul');
+  ul.className = 'list day-card';
+  const head = document.createElement('li');
+  head.className = 'day' + (date === todayYmd() ? ' is-today' : '');
+  head.innerHTML = '<span class="what"></span>';
+  head.querySelector('.what').textContent = dayTitle(date);
+  ul.appendChild(head);
+
+  const row = (t, isFact) => {
+    const li = document.createElement('li');
+    li.className = 'tap item' + (isFact ? ' fact' : ' plan') + (t.pending ? ' pending' : '');
+    li.innerHTML = '<span class="what"><span></span><small></small></span><span class="sum"></span>';
+    li.querySelector('.what span').textContent = t.category;
+    li.querySelector('.what small').textContent = isFact ? (t.comment || '') : '';
+    const sum = li.querySelector('.sum');
+    sum.textContent = (t.type === 'Доход' ? '+' : '') + money(t.amount);
+    sum.classList.toggle('income', t.type === 'Доход');
+    if (isFact) {
+      const del = document.createElement('button');
+      del.className = 'del';
+      del.type = 'button';
+      del.setAttribute('aria-label', 'Удалить');
+      del.textContent = '✕';
+      del.onclick = () => removeTx(t);
+      li.appendChild(del);
+      li.onclick = (e) => { if (!e.target.closest('.del')) startEdit(t); };
+    } else {
+      li.onclick = () => prefillFromPlan(t, g.facts);
+    }
+    ul.appendChild(li);
+  };
+
+  g.plans.forEach((t) => row(t, false));
+  if (g.plans.length && g.facts.length) {
+    const sep = document.createElement('li');
+    sep.className = 'sep';
+    ul.appendChild(sep);
+  }
+  g.facts.forEach((t) => row(t, true));
+  if (!g.plans.length && !g.facts.length) emptyRow(ul, 'Ничего не запланировано');
+
+  const planOut = g.plans.filter((t) => t.type !== 'Доход').reduce((s, t) => s + t.amount, 0);
+  if (planOut) {
+    const factOut = g.facts.filter((t) => t.type !== 'Доход').reduce((s, t) => s + t.amount, 0);
+    const left = planOut - factOut;
+    const foot = document.createElement('li');
+    foot.className = 'total' + (left < 0 ? ' neg' : '');
+    foot.innerHTML = '<span class="what">Остаток плана</span><span class="sum"></span>';
+    foot.querySelector('.sum').textContent = money(left);
+    ul.appendChild(foot);
+  }
+  return ul;
+}
+
+function prefillFromPlan(p, dayFacts) {
+  // Предлагаем то, что по этой категории в этот день ещё не потрачено.
+  const spent = (dayFacts || []).filter((f) => f.category === p.category).reduce((s, f) => s + f.amount, 0);
+  const rest = p.amount - spent;
   state.editing = null;
   state.type = p.type;
   state.category = p.category;
-  state.amount = String(p.left);
+  state.amount = String(rest > 0 ? rest : p.amount);
   state.plan = false;
   state.fromPlan = true;
   $('date').value = todayYmd();
   go('entry', true);
   renderEntry();
-}
-
-function renderRecent() {
-  const ul = $('recent');
-  ul.innerHTML = '';
-  const pending = state.queue.filter((q) => q.op === 'add' && q.tx.status === 'Факт').map((q) => Object.assign({ pending: true }, q.tx)).reverse();
-  const deleting = new Set(state.queue.filter((q) => q.op === 'delete').map((q) => q.id));
-  const updates = {};
-  state.queue.filter((q) => q.op === 'update').forEach((q) => { updates[q.id] = Object.assign(updates[q.id] || {}, q.fields); });
-  const server = ((state.snap && state.snap.recent) || [])
-    .filter((t) => !deleting.has(t.id))
-    .map((t) => (updates[t.id] ? Object.assign({}, t, updates[t.id], { pending: true }) : t));
-  const all = pending.concat(server);
-  const list = state.showAllRecent ? all : all.slice(0, 5);
-  $('recent-more').hidden = all.length <= 5;
-  $('recent-more').textContent = state.showAllRecent ? 'Свернуть' : `Показать ещё ${all.length - 5}`;
-  if (!list.length) return emptyRow(ul, 'Пока пусто');
-
-  for (const t of list) {
-    const li = document.createElement('li');
-    li.className = 'tap' + (t.pending ? ' pending' : '');
-    li.onclick = (e) => { if (!e.target.closest('.del')) startEdit(t); };
-    li.innerHTML = `<span class="when"></span><span class="what"><span></span><small></small></span><span class="sum"></span><button class="del" type="button" aria-label="Удалить">✕</button>`;
-    li.querySelector('.when').textContent = shortDate(t.date);
-    li.querySelector('.what span').textContent = t.category;
-    li.querySelector('.what small').textContent = [t.comment, t.account, t.who].filter(Boolean).join(' · ');
-    const sum = li.querySelector('.sum');
-    sum.textContent = (t.type === 'Доход' ? '+' : '') + money(t.amount);
-    sum.classList.toggle('income', t.type === 'Доход');
-    li.querySelector('.del').onclick = () => removeTx(t);
-    ul.appendChild(li);
-  }
 }
 
 function removeTx(t) {
@@ -546,7 +575,6 @@ function bind() {
   $('comment').addEventListener('keydown', (e) => { if (e.key === 'Enter') e.target.blur(); });
   $('save').onclick = save;
   $('edit-cancel').onclick = () => history.back();
-  $('recent-more').onclick = () => { state.showAllRecent = !state.showAllRecent; renderRecent(); };
   $('today-chip').onclick = () => {
     if (currentNav().sub) history.back(); else { go('summary'); renderSummary(); }
     refresh();

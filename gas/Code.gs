@@ -72,6 +72,7 @@ function snapshot_() {
     who: ref.who,
     expected: expected_(rows, sv, tz),
     recent: recent_(rows, tz),
+    feed: feed_(rows, sv, tz),
     serverTime: new Date().toISOString(),
   };
 }
@@ -156,6 +157,30 @@ function expected_(rows, sv, tz) {
     }
   });
   return out;
+}
+
+/**
+ * Лента по дням: все планы и факты от начала периода (и как минимум за последнюю неделю)
+ * до сегодня + 14 дней. Приложение раскладывает их по дням само.
+ */
+function feed_(rows, sv, tz) {
+  const today = sv.values.today || ymd_(new Date(), tz);
+  const weekAgo = addDays_(today, -7);
+  const start = sv.values.periodStart && sv.values.periodStart < weekAgo ? sv.values.periodStart : weekAgo;
+  const to = addDays_(today, EXPECTED_DAYS);
+  const pick = (t) => ({
+    id: t.id, date: t.date, type: t.type, amount: t.amount, category: t.category,
+    account: t.account, who: t.who, comment: t.status === 'Факт' ? t.comment : '',
+  });
+  const plans = [];
+  const facts = [];
+  rows.forEach((x) => {
+    const t = txObj_(x.v, tz);
+    if (t.date < start || t.date > to) return;
+    if (t.status === 'План') plans.push(pick(t));
+    else if (t.status === 'Факт') facts.push(pick(t));
+  });
+  return { from: start, to: to, today: today, plans: plans, facts: facts };
 }
 
 function recent_(rows, tz) {

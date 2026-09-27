@@ -163,6 +163,15 @@ h2 { font-size: 15px; color: var(--muted); font-weight: 600; margin: 14px 0 0; }
 .list li.day.overdue .what { color: var(--danger); }
 .list li.day .sum { color: var(--muted); font-weight: 600; }
 .list li.item { padding-left: 22px; }
+#days { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
+#days h2 { margin: 8px 0 0; }
+.list li.plan .what span, .list li.plan .sum { color: var(--muted); }
+.list li.plan .sum.income { color: var(--income); opacity: .75; }
+.list li.sep { padding: 0; border-top: 0; height: 0; border-bottom: 2px solid var(--line); margin: 0 14px; }
+.list li.sep + li { border-top: 0; }
+.list li.total { font-weight: 600; font-size: 14px; }
+.list li.total .what { color: var(--muted); }
+.list li.total.neg .sum { color: var(--danger); }
 
 .hint { color: var(--muted); font-size: 13px; text-align: center; margin: 0; }
 #recent-more { width: 100%; }
