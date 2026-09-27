@@ -1,0 +1,11 @@
+# Личные данные — не публикуем (GitHub Pages = публичный репозиторий)
+*.xlsx
+*.xls
+*.csv
+ТЗ*.md
+
+# Служебное
+.claude/
+.vscode/
+Thumbs.db
+desktop.ini

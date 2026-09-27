@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#111418" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Бюджет">
+  <title>Бюджет</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Первый запуск / настройки -->
+  <section id="setup" class="screen" hidden>
+    <h1>Бюджет</h1>
+    <label class="field">
+      <span>Адрес веб-приложения Apps Script</span>
+      <input id="setup-url" type="url" inputmode="url" autocomplete="off" placeholder="https://script.google.com/macros/s/…/exec">
+    </label>
+    <div class="field">
+      <span>Кто пользуется этим телефоном</span>
+      <div class="seg" id="setup-who">
+        <button type="button" data-v="Егор">Егор</button>
+        <button type="button" data-v="Арина">Арина</button>
+      </div>
+    </div>
+    <p class="err" id="setup-err" hidden></p>
+    <button class="primary" id="setup-save" type="button">Готово</button>
+    <button class="ghost" id="setup-cancel" type="button" hidden>Отмена</button>
+  </section>
+
+  <!-- Экран ввода -->
+  <section id="entry" class="screen" hidden>
+    <header class="topbar">
+      <button class="today" id="today-chip" type="button" aria-label="Открыть сводку">
+        <span class="today-label">На сегодня</span>
+        <span class="today-value" id="today-left">—</span>
+      </button>
+      <div class="seg small" id="type-seg">
+        <button type="button" data-v="Расход" class="on">Расход</button>
+        <button type="button" data-v="Доход">Доход</button>
+      </div>
+    </header>
+
+    <div class="edit-bar" id="edit-bar" hidden>
+      <span>Изменение записи</span>
+      <button type="button" id="edit-cancel">Отмена</button>
+    </div>
+
+    <div class="amount" id="amount"><span id="amount-value">0</span><span class="cur">₸</span></div>
+
+    <div class="chips" id="chips"></div>
+
+    <div class="row">
+      <input id="comment" type="text" enterkeyhint="done" autocomplete="off" placeholder="Комментарий">
+    </div>
+    <div class="row two">
+      <select id="account" aria-label="Счёт"></select>
+      <label class="date-pill">
+        <span id="date-label">Сегодня</span>
+        <input id="date" type="date" aria-label="Дата">
+      </label>
+      <button type="button" class="plan-toggle" id="plan-toggle" aria-pressed="false">План</button>
+    </div>
+
+    <div class="pad" id="pad">
+      <button type="button" data-k="1">1</button><button type="button" data-k="2">2</button><button type="button" data-k="3">3</button>
+      <button type="button" data-k="4">4</button><button type="button" data-k="5">5</button><button type="button" data-k="6">6</button>
+      <button type="button" data-k="7">7</button><button type="button" data-k="8">8</button><button type="button" data-k="9">9</button>
+      <button type="button" data-k="000">000</button><button type="button" data-k="0">0</button><button type="button" data-k="back" aria-label="Стереть">⌫</button>
+    </div>
+
+    <button class="primary save" id="save" type="button" disabled>Записать</button>
+  </section>
+
+  <!-- Сводка -->
+  <section id="summary" class="screen" hidden>
+    <header class="topbar">
+      <button class="icon" id="back" type="button" aria-label="Назад к вводу">←</button>
+      <span class="stamp" id="stamp"></span>
+      <button class="icon" id="settings" type="button" aria-label="Настройки">⚙</button>
+    </header>
+
+    <div class="hero">
+      <div class="hero-label">Остаток на сегодня</div>
+      <div class="hero-value" id="s-today">—</div>
+      <div class="hero-sub" id="s-limit"></div>
+    </div>
+
+    <div class="stats">
+      <div><span>Свободно на период</span><b id="s-free">—</b></div>
+      <div><span>На счетах</span><b id="s-balance">—</b></div>
+      <div><span>Дней осталось</span><b id="s-days">—</b></div>
+    </div>
+
+    <h2>Ожидаемые · 14 дней</h2>
+    <ul class="list" id="expected"></ul>
+
+    <h2>Последние операции</h2>
+    <ul class="list" id="recent"></ul>
+    <button class="ghost" id="recent-more" type="button" hidden>Показать ещё</button>
+    <p class="hint">Тап по операции — изменить, ✕ — удалить</p>
+  </section>
+
+  <!-- Выбор категории -->
+  <div class="sheet" id="cat-sheet" hidden>
+    <div class="sheet-body">
+      <div class="sheet-head"><b>Категория</b><button class="icon" type="button" data-close>✕</button></div>
+      <ul class="cat-list" id="cat-list"></ul>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
