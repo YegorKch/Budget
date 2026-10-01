@@ -20,6 +20,7 @@ const state = {
   fromPlan: false,                     // ввод открыт тапом по ожидаемой позиции
 };
 
+const TRANSFER = 'Перевод';            // тип записи «перевод между счетами»: не трата и не доход
 const $ = (id) => document.getElementById(id);
 const fmt = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
 const money = (n) => fmt.format(Math.round(Number(n) || 0)).replace(/ | /g, ' ');
@@ -123,6 +124,7 @@ async function flush() {
       try {
         if (item.op === 'add') j = await apiPost({ action: 'add', tx: item.tx });
         else if (item.op === 'update') j = await apiPost({ action: 'update', id: item.id, fields: item.fields });
+        else if (item.op === 'setBalance') j = await apiPost({ action: 'setBalance', account: item.account, value: item.value, who: item.who });
         else j = await apiPost({ action: 'delete', id: item.id });
       } catch (e) {
         if (e.server) {                // сервер отказал — повторять бессмысленно
@@ -187,10 +189,7 @@ function renderChips() {
   box.appendChild(more);
 }
 
-function renderAccounts() {
-  const sel = $('account');
-  const accounts = (state.snap && state.snap.accounts) || [];
-  const cur = sel.value || LS.get('lastAccount', '') || (state.who === 'Арина' ? 'Kaspi Арина' : 'Kaspi Егор');
+function fillSelect(sel, accounts, cur) {
   sel.innerHTML = '';
   for (const a of accounts) {
     const o = document.createElement('option');
@@ -200,20 +199,38 @@ function renderAccounts() {
   if (accounts.includes(cur)) sel.value = cur;
 }
 
+function renderAccounts() {
+  const accounts = (state.snap && state.snap.accounts) || [];
+  const def = LS.get('lastAccount', '') || (state.who === 'Арина' ? 'Kaspi Арина' : 'Kaspi Егор');
+  fillSelect($('account'), accounts, $('account').value || def);
+  const from = $('from-account').value || def;
+  fillSelect($('from-account'), accounts, from);
+  fillSelect($('to-account'), accounts, $('to-account').value || accounts.find((a) => a !== from) || '');
+}
+
 function renderEntry() {
   const v = state.amount ? money(state.amount) : '0';
   $('amount-value').textContent = v;
   $('amount').classList.toggle('empty', !state.amount);
+  const isT = state.type === TRANSFER;
   $('amount').classList.toggle('income', state.type === 'Доход');
+  $('amount').classList.toggle('transfer-mode', isT);
   for (const b of $('type-seg').children) b.classList.toggle('on', b.dataset.v === state.type);
+  $('chips').hidden = isT;
+  $('transfer').hidden = !isT;
+  $('account').hidden = isT;
+  $('plan-toggle').hidden = isT;
   const d = $('date').value || todayYmd();
   $('date-label').textContent = dateLabel(d);
   $('date').parentElement.classList.toggle('changed', d !== todayYmd());
   $('plan-toggle').setAttribute('aria-pressed', String(state.plan));
-  $('save').disabled = !(Number(state.amount) > 0 && state.category);
-  $('save').textContent = state.editing ? 'Сохранить изменения' : state.plan ? 'Записать в план' : 'Записать';
+  const ready = isT
+    ? $('from-account').value && $('to-account').value && $('from-account').value !== $('to-account').value
+    : state.category;
+  $('save').disabled = !(Number(state.amount) > 0 && ready);
+  $('save').textContent = state.editing ? 'Сохранить изменения' : isT ? 'Перевести' : state.plan ? 'Записать в план' : 'Записать';
   $('edit-bar').hidden = !state.editing;
-  renderChips();
+  if (!isT) renderChips();
 }
 
 function press(k) {
@@ -224,17 +241,29 @@ function press(k) {
 }
 
 function save() {
+  if ($('save').disabled) return;
   const amount = Number(state.amount);
-  if (!(amount > 0) || !state.category) return;
-  const fields = {
+  const isT = state.type === TRANSFER;
+  const fields = isT ? {
+    date: $('date').value || todayYmd(),
+    status: 'Факт',
+    type: TRANSFER,
+    amount: amount,
+    category: TRANSFER,
+    account: $('from-account').value,
+    toAccount: $('to-account').value,
+    comment: $('comment').value.trim(),
+  } : {
     date: $('date').value || todayYmd(),
     status: state.plan ? 'План' : 'Факт',
     type: state.type,
     amount: amount,
     category: state.category,
     account: $('account').value,
+    toAccount: '',
     comment: $('comment').value.trim(),
   };
+  const label = isT ? `${fields.account} → ${fields.toAccount}` : fields.category;
   if (state.editing) {
     const id = state.editing.id;
     const queued = state.queue.find((q) => q.op === 'add' && q.tx.id === id);
@@ -245,12 +274,12 @@ function save() {
     } else {
       enqueue({ op: 'update', id: id, fields: fields });
     }
-    toast(`Изменено: ${money(amount)} · ${fields.category}`);
+    toast(`Изменено: ${money(amount)} · ${label}`);
   } else {
     const tx = Object.assign({ id: uid(), who: state.who }, fields);
-    LS.set('lastAccount', tx.account);
+    if (!isT) LS.set('lastAccount', tx.account);
     enqueue({ op: 'add', tx: tx, at: Date.now() });
-    toast(`${tx.status === 'План' ? 'В план' : 'Записано'}: ${money(amount)} · ${tx.category}`);
+    toast(`${isT ? 'Перевод' : tx.status === 'План' ? 'В план' : 'Записано'}: ${money(amount)} · ${label}`);
   }
   const back = currentNav().sub;
   resetEntry();
@@ -263,6 +292,7 @@ function resetEntry() {
   state.amount = '';
   state.category = '';
   state.plan = false;
+  if (state.type === TRANSFER) state.type = 'Расход';   // перевод — разовое действие
   $('comment').value = '';
   $('date').value = todayYmd();
   const last = LS.get('lastAccount', '');
@@ -278,7 +308,12 @@ function startEdit(t) {
   state.plan = t.status === 'План';
   $('comment').value = t.comment || '';
   $('date').value = t.date;
-  if (t.account && [...$('account').options].some((o) => o.value === t.account)) $('account').value = t.account;
+  const has = (sel, v) => v && [...sel.options].some((o) => o.value === v);
+  if (has($('account'), t.account)) $('account').value = t.account;
+  if (t.type === TRANSFER) {
+    if (has($('from-account'), t.account)) $('from-account').value = t.account;
+    if (has($('to-account'), t.toAccount)) $('to-account').value = t.toAccount;
+  }
   go('entry', true);
   renderEntry();
 }
@@ -356,10 +391,118 @@ function renderSummary() {
   $('today-left').classList.toggle('neg', left < 0);
   $('s-limit').textContent = sm.dailyLimit != null ? `лимит на день ${money(sm.dailyLimit)}` : '';
   set('s-free', sm.freeNow);
-  set('s-balance', sm.balanceNow);
+  const bal = (state.snap && state.snap.balances) || [];
+  const total = bal.length
+    ? Object.values(currentBalances()).reduce((a, v) => a + v, 0)
+    : (sm.balanceNow != null ? sm.balanceNow + pendingBalanceDelta().total : null);
+  set('s-balance', total);
+  renderBalances();
   $('s-days').textContent = sm.daysLeft != null ? sm.daysLeft : '—';
   renderStamp();
   renderDays();
+}
+
+/** Неотправленные факты из очереди: на сколько они меняют каждый счёт и общий остаток. */
+function pendingBalanceDelta() {
+  const by = {};
+  let total = 0;
+  const add = (acc, v) => { by[acc || 'Без счёта'] = (by[acc || 'Без счёта'] || 0) + v; };
+  state.queue.filter((q) => q.op === 'add' && q.tx.status === 'Факт').forEach(({ tx }) => {
+    if (tx.type === 'Расход') { add(tx.account, -tx.amount); total -= tx.amount; }
+    else if (tx.type === 'Доход') { add(tx.account, tx.amount); total += tx.amount; }
+    else if (tx.type === TRANSFER) { add(tx.account, -tx.amount); add(tx.toAccount, tx.amount); }
+  });
+  return { by: by, total: total };
+}
+
+/**
+ * Остатки по счетам с учётом очереди: сверка задаёт сумму, факты после неё её двигают.
+ * Порядок важен — проходим очередь как есть.
+ */
+function currentBalances() {
+  const cur = {};
+  ((state.snap && state.snap.balances) || []).forEach((b) => { cur[b.name] = b.now; });
+  const add = (acc, v) => { if (acc in cur) cur[acc] += v; };
+  for (const q of state.queue) {
+    if (q.op === 'setBalance') { cur[q.account] = q.value; continue; }
+    if (q.op !== 'add' || q.tx.status !== 'Факт') continue;
+    const tx = q.tx;
+    if (tx.type === 'Расход') add(tx.account, -tx.amount);
+    else if (tx.type === 'Доход') add(tx.account, tx.amount);
+    else if (tx.type === TRANSFER) { add(tx.account, -tx.amount); add(tx.toAccount, tx.amount); }
+  }
+  return cur;
+}
+
+/** Раскрывающийся список остатков по счетам (лист «Счета») и история сверок. */
+function renderBalances() {
+  const open = !!LS.get('showBalances', false);
+  $('accounts-panel').hidden = !open;
+  $('balance-toggle').setAttribute('aria-expanded', String(open));
+  if (!open) return;
+  const ul = $('balances');
+  ul.innerHTML = '';
+  const list = (state.snap && state.snap.balances) || [];
+  if (!list.length) emptyRow(ul, 'Нет данных по счетам — обнови Apps Script и запусти migrateAccountsV3');
+  const cur = currentBalances();
+  const pendingSet = new Set(state.queue.filter((q) => q.op === 'setBalance').map((q) => q.account));
+  for (const b of list) {
+    const now = cur[b.name];
+    const li = document.createElement('li');
+    li.className = 'tap acc' + (now < 0 ? ' neg' : '') + (!now ? ' dim' : '') + (pendingSet.has(b.name) ? ' pending' : '');
+    li.innerHTML = '<span class="what"><span></span><small></small></span><span class="sum"></span>';
+    li.querySelector('.what span').textContent = b.name;
+    li.querySelector('.sum').textContent = money(now);
+    li.onclick = () => editBalance(b.name, now);
+    ul.appendChild(li);
+  }
+  renderBalanceHistory();
+}
+
+function editBalance(name, now) {
+  const raw = prompt(`Сколько сейчас на счёте «${name}»?`, String(Math.round(now)));
+  if (raw == null) return;
+  const value = Number(String(raw).replace(/[\s\u00a0]/g, '').replace(',', '.'));
+  if (!isFinite(value) || String(raw).trim() === '') return toast('Нужно число');
+  if (Math.round(value) === Math.round(now)) return toast('Остаток не изменился');
+  enqueue({ op: 'setBalance', account: name, value: value, who: state.who, at: Date.now() });
+  toast(`${name}: ${money(now)} → ${money(value)}`);
+}
+
+function renderBalanceHistory() {
+  const ul = $('balance-history');
+  ul.innerHTML = '';
+  const pending = state.queue.filter((q) => q.op === 'setBalance').reverse().map((q) => {
+    const d = new Date(q.at || Date.now());
+    const at = `${todayYmd()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    return { at: at, account: q.account, before: null, after: q.value, who: q.who, pending: true };
+  });
+  const list = pending.concat((state.snap && state.snap.balanceHistory) || []);
+  if (!list.length) return emptyRow(ul, 'Изменений пока не было');
+  for (const h of list) {
+    const li = document.createElement('li');
+    li.className = 'hist' + (h.pending ? ' pending' : '');
+    li.innerHTML = '<span class="when"></span><span class="what"><span></span><small></small></span><span class="sum"></span>';
+    const [date, time] = h.at.split(' ');
+    li.querySelector('.when').textContent = `${shortDate(date)}\n${time || ''}`;
+    li.querySelector('.what span').textContent = h.account;
+    li.querySelector('.what small').textContent =
+      (h.before != null ? `${money(h.before)} → ${money(h.after)}` : `→ ${money(h.after)}`) + (h.who ? ` · ${h.who}` : '');
+    const diff = h.before != null ? h.after - h.before : null;
+    const sum = li.querySelector('.sum');
+    sum.textContent = diff == null ? '' : (diff > 0 ? '+' : '') + money(diff);
+    sum.classList.toggle('income', diff > 0);
+    sum.classList.toggle('neg', diff < 0);
+    ul.appendChild(li);
+  }
+}
+
+function openTransfer() {
+  resetEntry();
+  state.type = TRANSFER;
+  state.fromPlan = true;          // открыт из сводки: «назад» и сохранение возвращают туда
+  go('entry', true);
+  renderEntry();
 }
 
 const WEEKDAYS = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
@@ -434,9 +577,10 @@ function dayCard(date, g) {
 
   const row = (t, isFact) => {
     const li = document.createElement('li');
-    li.className = 'tap item' + (isFact ? ' fact' : ' plan') + (t.pending ? ' pending' : '');
+    const isT = t.type === TRANSFER;
+    li.className = 'tap item' + (isFact ? ' fact' : ' plan') + (isT ? ' transfer' : '') + (t.pending ? ' pending' : '');
     li.innerHTML = '<span class="what"><span></span><small></small></span><span class="sum"></span>';
-    li.querySelector('.what span').textContent = t.category;
+    li.querySelector('.what span').textContent = isT ? `${t.account} → ${t.toAccount}` : t.category;
     li.querySelector('.what small').textContent = isFact ? (t.comment || '') : '';
     const sum = li.querySelector('.sum');
     sum.textContent = (t.type === 'Доход' ? '+' : '') + money(t.amount);
@@ -465,9 +609,9 @@ function dayCard(date, g) {
   g.facts.forEach((t) => row(t, true));
   if (!g.plans.length && !g.facts.length) emptyRow(ul, 'Ничего не запланировано');
 
-  const planOut = g.plans.filter((t) => t.type !== 'Доход').reduce((s, t) => s + t.amount, 0);
+  const planOut = g.plans.filter((t) => t.type === 'Расход').reduce((s, t) => s + t.amount, 0);
   if (planOut) {
-    const factOut = g.facts.filter((t) => t.type !== 'Доход').reduce((s, t) => s + t.amount, 0);
+    const factOut = g.facts.filter((t) => t.type === 'Расход').reduce((s, t) => s + t.amount, 0);
     const left = planOut - factOut;
     const foot = document.createElement('li');
     foot.className = 'total' + (left < 0 ? ' neg' : '');
@@ -494,7 +638,8 @@ function prefillFromPlan(p, dayFacts) {
 }
 
 function removeTx(t) {
-  if (!confirm(`Удалить ${money(t.amount)} · ${t.category}?`)) return;
+  const label = t.type === TRANSFER ? `перевод ${t.account} → ${t.toAccount}` : t.category;
+  if (!confirm(`Удалить ${money(t.amount)} · ${label}?`)) return;
   const i = state.queue.findIndex((q) => q.op === 'add' && q.tx.id === t.id);
   if (i >= 0) {                      // ещё не ушло на сервер — просто убрать из очереди
     state.queue.splice(i, 1);
@@ -568,8 +713,13 @@ function bind() {
     if (!v || v === state.type) return;
     state.type = v;
     state.category = '';
+    if (v === TRANSFER) state.plan = false;
     renderEntry();
   });
+  $('from-account').addEventListener('change', renderEntry);
+  $('to-account').addEventListener('change', renderEntry);
+  $('balance-toggle').onclick = () => { LS.set('showBalances', !LS.get('showBalances', false)); renderBalances(); };
+  $('transfer-btn').onclick = openTransfer;
   $('plan-toggle').onclick = () => { state.plan = !state.plan; renderEntry(); };
   $('date').addEventListener('change', renderEntry);
   $('comment').addEventListener('keydown', (e) => { if (e.key === 'Enter') e.target.blur(); });
