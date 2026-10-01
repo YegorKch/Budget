@@ -759,5 +759,13 @@ if (!state.url || !state.who) {
 }
 
 if ('serviceWorker' in navigator) {
+  // Новая версия приложения встала — перезагрузиться один раз, чтобы не ждать следующего запуска.
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloaded) return;
+    reloaded = true;
+    location.reload();
+  });
   window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
 }
