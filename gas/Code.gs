@@ -36,6 +36,8 @@ const TRANSFER = 'Перевод';   // тип и категория перев�
 // Обязательные статьи (пометка «да» в «Справочниках», колонка C) — для прогноза «хватит ли до зарплаты»
 const MANDATORY_DEFAULT = ['Рассрочки', 'Арина рассрочки', 'Каспи рэд (кредитка)', 'Арина учеба', 'Ком услуги',
   'Домашний интернет', 'Сбережения', 'Арина англ', 'Тренер Арине', 'Подписки/Тарифы'];
+// Ежедневные статьи (пометка «да» в «Справочниках», колонка E) — по их темпу прогноз считает, хватит ли денег
+const DAILY_DEFAULT = ['Поесть', 'Такси', 'Общественный транспорт', 'Продукты'];
 
 // ---------- HTTP ----------
 
@@ -102,11 +104,11 @@ function snapshot_() {
 
 /**
  * Ключ → значение из колонки C/B «Свода» и таблица по категориям
- * (A категория, B тип, C план, D факт, H осталось по плану, M обязательная).
+ * (A категория, B тип, C план, D факт, H осталось по плану, M обязательная, N ежедневная).
  */
 function readSummary_(ss, tz) {
   const sh = ss.getSheetByName(SHEET_SUMMARY);
-  const data = sh.getRange(1, 1, sh.getLastRow(), Math.min(13, sh.getMaxColumns())).getValues();
+  const data = sh.getRange(1, 1, sh.getLastRow(), Math.min(14, sh.getMaxColumns())).getValues();
   const values = {};
   const topRaw = [];
   const byCategory = {};
@@ -128,7 +130,7 @@ function readSummary_(ss, tz) {
       // Одно имя может быть и доходом, и расходом («Прочие») — ключ с типом.
       byCategory[cat + '|' + type] = { type: type, plan: num_(plan), fact: num_(fact) };
       table.push({ name: String(cat), type: type, plan: num_(plan), fact: num_(fact),
-        left: num_(data[i][7]), mandatory: data[i][12] === 'да' });
+        left: num_(data[i][7]), mandatory: data[i][12] === 'да', daily: data[i][13] === 'да' });
     }
   }
   return {
@@ -769,6 +771,17 @@ function migrateV4() {
       log.push('Справочники: колонка «Обязательная»');
     }
 
+    // 1б. Ежедневные статьи
+    if (ref.getRange('E1').getValue() !== 'Ежедневная') {
+      ref.getRange('E1').setValue('Ежедневная');
+      ref.getRange('A1').copyFormatToRange(ref, 5, 5, 1, 1);
+      const n = Math.max(ref.getLastRow() - 1, 1);
+      const names = ref.getRange(2, 1, n, 2).getValues();
+      ref.getRange(2, 5, n, 1).setValues(names.map((r) =>
+        [r[1] === 'Расход' && DAILY_DEFAULT.indexOf(String(r[0])) >= 0 ? 'да' : '']));
+      log.push('Справочники: колонка «Ежедневная»');
+    }
+
     // 2. Недостающие пары «категория + тип» из транзакций — справочник читаем один раз, дописываем пачкой
     const last = tx.getLastRow();
     const txv = last > 1 ? tx.getRange(2, 1, last - 1, COL['Комментарий']).getValues() : [];
@@ -833,7 +846,7 @@ function writeCategoryTableFormulas_(sv) {
   if (head < 1) throw new Error('На «Своде» не найдена таблица по категориям');
   const ps = `$B$${summaryKeyRow_(sv, 'periodStart')}`;
   const pe = `$B$${summaryKeyRow_(sv, 'periodEnd')}`;
-  sv.getRange(head, 12, 1, 2).setValues([['Факт за 7 дней', 'Обязательная']])
+  sv.getRange(head, 12, 1, 3).setValues([['Факт за 7 дней', 'Обязательная', 'Ежедневная']])
     .setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#37474F').setWrap(true);
   const cde = [];
   const j = [];
@@ -861,14 +874,20 @@ function writeCategoryTableFormulas_(sv) {
   sv.getRange(head + 1, 10, 100, 1).setFormulas(j);
   sv.getRange(head + 1, 12, 100, 2).setFormulas(lm);
   sv.getRange(head + 1, 12, 100, 1).setNumberFormat('#,##0;-#,##0;""');
+  // «Ежедневная» — одной формулой массива на всю колонку
+  sv.getRange(head + 1, 14, 100, 1).clearContent();
+  sv.getRange(head + 1, 14).setFormula(`=ARRAYFORMULA(IF($A${head + 1}:$A${head + 100}="","",` +
+    `IF('Справочники'!E2:E101="да","да","")))`);
   sv.setColumnWidth(12, 100);
   sv.setColumnWidth(13, 100);
+  sv.setColumnWidth(14, 100);
 }
 
 /**
- * Блок прогноза под «Накоплениями»: деньги на жизнь до зарплаты, можно в день, темп, когда закончатся.
- * «На жизнь» = на счетах + ещё ожидаемые доходы − ещё не оплаченные обязательные статьи.
- * Темп — средние траты за 7 полных дней по всем необязательным статьям.
+ * Блок прогноза под «Накоплениями»: хватит ли денег на ежедневное (еда, такси, транспорт) до конца периода.
+ * «На ежедневное» = на счетах + ещё ожидаемые доходы − все ещё не оплаченные планы, кроме ежедневных статей.
+ * Темп — средние траты за 7 полных дней по ежедневным статьям. Разовые траты вне плана в темп не входят:
+ * они уменьшают остаток на счетах, когда случаются, и прогноз пересчитывается.
  */
 function writeForecastFormulas_(sv) {
   const data = sv.getRange(1, 1, sv.getLastRow(), 2).getValues();
@@ -882,9 +901,11 @@ function writeForecastFormulas_(sv) {
     ['', '', '', ''],
     ['Прогноз до конца периода', '', '', ''],
     ['Начало следующего периода', `=${cell('periodEnd')}+1`, 'payday', 'День после конца периода'],
-    ['Деньги на жизнь до конца периода', '', 'lifeMoney', 'На счетах + ожидаемые доходы − ещё не оплаченные обязательные статьи'],
-    ['Можно тратить в день', '', 'dailyBudget', 'Деньги на жизнь / дней осталось'],
-    ['Темп трат за 7 дней, ₸/день', '', 'pace7', 'Все необязательные статьи, 7 полных дней до сегодня'],
+    ['Деньги на ежедневное до конца периода', '', 'lifeMoney',
+      'На счетах + ожидаемые доходы − все ещё не оплаченные планы, кроме ежедневных статей'],
+    ['Можно тратить в день на ежедневное', '', 'dailyBudget', 'Деньги на ежедневное / дней осталось'],
+    ['Темп ежедневных трат за 7 дней, ₸/день', '', 'pace7',
+      'Статьи с «да» в «Справочниках», колонка E «Ежедневная»; 7 полных дней до сегодня'],
     ['При таком темпе деньги закончатся', '', 'runOutDate', 'Пусто — темп нулевой'],
     ['Прогноз к концу периода: запас (+) / нехватка (−)', '', 'forecastGap', 'Деньги на жизнь − темп × дней осталось'],
   ];
@@ -898,9 +919,9 @@ function writeForecastFormulas_(sv) {
   };
   set('payday', `=${cell('periodEnd')}+1`, 'dd.mm.yyyy');
   set('lifeMoney', `=ROUND(${cell('balanceNow')}+SUMIF(${col('B')},"Доход",${col('H')})` +
-    `-SUMIFS(${col('H')},${col('B')},"Расход",${col('M')},"да"),0)`, '#,##0');
+    `-SUMIFS(${col('H')},${col('B')},"Расход",${col('N')},"<>да"),0)`, '#,##0');
   set('dailyBudget', `=ROUND(${cell('lifeMoney')}/${cell('daysLeft')},0)`, '#,##0');
-  set('pace7', `=ROUND(SUMIFS(${col('L')},${col('B')},"Расход",${col('M')},"<>да")/7,0)`, '#,##0');
+  set('pace7', `=ROUND(SUMIFS(${col('L')},${col('B')},"Расход",${col('N')},"да")/7,0)`, '#,##0');
   set('runOutDate', `=IF(${cell('pace7')}<=0,"",IF(${cell('lifeMoney')}<=0,TODAY(),` +
     `TODAY()+INT(${cell('lifeMoney')}/${cell('pace7')})))`, 'dd.mm.yyyy');
   set('forecastGap', `=ROUND(${cell('lifeMoney')}-${cell('pace7')}*${cell('daysLeft')},0)`, '#,##0;-#,##0');

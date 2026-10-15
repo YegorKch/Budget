@@ -593,7 +593,8 @@ function renderForecast() {
   const runOut = sm.runOutDate ? shortDate(sm.runOutDate) : '';
   box.innerHTML = '';
   const add = (cls, html) => { const d = document.createElement('div'); d.className = cls; d.innerHTML = html; box.appendChild(d); };
-  add('f-title', `До ${sm.payday ? shortDate(sm.payday) : 'конца периода'} · ${sm.daysLeft} дн. · на жизнь ${money(sm.lifeMoney)}`);
+  add('f-title', `Еда, такси, транспорт · до ${sm.payday ? shortDate(sm.payday) : 'конца периода'} · ${sm.daysLeft} дн. · ` +
+    `есть ${money(sm.lifeMoney)}`);
   add('f-row', `<span>Можно тратить в день</span><b>${money(sm.dailyBudget)}</b>`);
   add('f-row', `<span>Тратите сейчас (за 7 дней)</span><b>${money(sm.pace7)}</b>`);
   add('verdict ' + (ok ? 'ok' : 'bad'), ok
@@ -625,7 +626,7 @@ function renderEnvelopes() {
     const note = unplanned ? `вне плана ${money(c.fact)}`
       : over ? `перерасход ${money(-left)}`
         : left < 0 ? `сверх плана ${money(-left)}`
-        : `осталось ${money(left)}${c.mandatory ? '' : ' · ≈' + money(left / days) + '/день'}`;
+        : `осталось ${money(left)}${c.daily ? ' · ≈' + money(left / days) + '/день' : ''}`;
     li.innerHTML = '<div class="env-top"><span></span><small></small></div><div class="bar"><i></i></div>';
     li.querySelector('span').textContent = c.name + (c.plan ? ` · ${money(c.fact)} из ${money(c.plan)}` : '');
     li.querySelector('small').textContent = note;
@@ -729,8 +730,8 @@ function renderReport() {
     const gap = Number(sm.forecastGap) || 0;
     h('Прогноз до конца периода');
     tbl(null, [
-      { cells: ['Деньги на жизнь', money(sm.lifeMoney)] },
-      { cells: ['Можно тратить в день', money(sm.dailyBudget)] },
+      { cells: ['Деньги на ежедневное', money(sm.lifeMoney)] },
+      { cells: ['Можно в день (еда, такси, транспорт)', money(sm.dailyBudget)] },
       { cells: ['Тратите сейчас (7 дней)', money(sm.pace7)] },
       { cells: [gap >= 0 ? 'Запас к концу периода' : 'Нехватка к концу периода', money(Math.abs(gap))],
         tdCls: [null, gap >= 0 ? 'ok' : 'over'], cls: 'total' },
