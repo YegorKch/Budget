@@ -1,6 +1,6 @@
 // Кеширует оболочку приложения. Запросы к Apps Script не трогает — ими управляет app.js.
 // При любом изменении файлов оболочки поднять VERSION, иначе телефоны останутся на старой версии.
-const VERSION = 'v1.2.1';
+const VERSION = 'v1.2.3';
 const CACHE = 'budget-' + VERSION;
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];

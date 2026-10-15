@@ -600,6 +600,19 @@ function renderForecast() {
   add('verdict ' + (ok ? 'ok' : 'bad'), ok
     ? `Хватит до ${sm.payday ? shortDate(sm.payday) : 'конца периода'}, запас ≈ ${money(gap)}`
     : `Не хватит ≈ ${money(-gap)}${runOut ? ' · деньги закончатся ~' + runOut : ''}`);
+  // Ожидаемые (не гарантированные) доходы — отдельной строкой «а если придут»
+  const exp = Number(sm.expectedLeft) || 0;
+  if (exp > 0 && sm.dailyBudgetMax != null) {
+    const gm = Number(sm.forecastGapMax) || 0;
+    add('f-alt', `Если придёт ожидаемое (+${money(exp)}): ${money(sm.dailyBudgetMax)} в день · ` +
+      (gm >= 0 ? `запас ≈ ${money(gm)}` : `не хватит ≈ ${money(-gm)}`));
+  }
+  // Гарантированный доход, который должен был прийти, но не пришёл
+  const guaranteed = new Set(((state.snap && state.snap.categoryTable) || [])
+    .filter((c) => c.type === 'Доход' && c.guaranteed).map((c) => c.name));
+  ((state.snap && state.snap.expected) || [])
+    .filter((x) => x.type === 'Доход' && x.overdue && guaranteed.has(x.category))
+    .forEach((x) => add('f-late', `⚠ Ждём «${x.category}» с ${shortDate(x.date)} — ${money(x.left)}`));
 }
 
 /** Конверты: план и факт по статьям расходов за период («Свод»). */
@@ -650,6 +663,7 @@ function renderDays() {
   facts.forEach((t) => day(t.date).facts.push(t));
   day(today);
 
+  markPlanCoverage(plans);
   $('today-card').innerHTML = '';
   $('today-card').appendChild(dayCard(today, days[today]));
 
@@ -756,8 +770,8 @@ function renderReport() {
   }
 
   h('Доходы: план и факт');
-  tbl(['Источник', 'План', 'Факт'], inc.filter((c) => c.plan || c.fact).sort((a, b) => b.fact - a.fact)
-    .map((c) => ({ cells: [c.name, c.plan ? money(c.plan) : '—', money(c.fact)] })));
+  tbl(['Источник', 'План', 'Факт', ''], inc.filter((c) => c.plan || c.fact).sort((a, b) => b.fact - a.fact)
+    .map((c) => ({ cells: [c.name, c.plan ? money(c.plan) : '—', money(c.fact), c.guaranteed ? 'гарант.' : 'ожид.'] })));
 
   // Динамика по неделям: необязательные расходы
   const varFacts = facts.filter((t) => t.type === 'Расход' && !mand[t.category + '|' + t.type]);
@@ -797,6 +811,26 @@ function renderReport() {
   tbl(['', 'Всего', 'Необязательные'], Object.keys(who).map((k) => ({ cells: [k, money(who[k].all), money(who[k].v)] })));
 }
 
+/**
+ * Какая часть каждого плана уже покрыта фактом. Факт статьи за период («Свод», уже с учётом сдвига
+ * для зарплаты и обязательных) гасит её планы по порядку дат — как в «Календаре план».
+ * Оплатил рассрочки 06-го при плане на 10-е — план 10-го исчезает из ленты.
+ */
+function markPlanCoverage(plans) {
+  const fact = {};
+  ((state.snap && state.snap.categoryTable) || []).forEach((c) => { fact[c.name + '|' + c.type] = c.fact; });
+  state.queue.filter((q) => q.op === 'add' && q.tx.status === 'Факт').forEach(({ tx }) => {
+    const k = tx.category + '|' + tx.type;
+    if (k in fact) fact[k] += tx.amount;
+  });
+  plans.slice().sort((a, b) => a.date.localeCompare(b.date)).forEach((p) => {
+    const k = p.category + '|' + p.type;
+    const covered = Math.min(p.amount, Math.max(0, fact[k] || 0));
+    fact[k] = (fact[k] || 0) - covered;
+    p.left = p.amount - covered;
+  });
+}
+
 function dayCard(date, g) {
   const ul = document.createElement('ul');
   ul.className = 'list day-card';
@@ -812,9 +846,10 @@ function dayCard(date, g) {
     li.className = 'tap item' + (isFact ? ' fact' : ' plan') + (isT ? ' transfer' : '') + (t.pending ? ' pending' : '');
     li.innerHTML = '<span class="what"><span></span><small></small></span><span class="sum"></span>';
     li.querySelector('.what span').textContent = isT ? `${t.account} → ${t.toAccount}` : t.category;
-    li.querySelector('.what small').textContent = isFact ? (t.comment || '') : '';
+    const partial = !isFact && t.left != null && t.left < t.amount;
+    li.querySelector('.what small').textContent = isFact ? (t.comment || '') : partial ? `из ${money(t.amount)}` : '';
     const sum = li.querySelector('.sum');
-    sum.textContent = (t.type === 'Доход' ? '+' : '') + money(t.amount);
+    sum.textContent = (t.type === 'Доход' ? '+' : '') + money(isFact || t.left == null ? t.amount : t.left);
     sum.classList.toggle('income', t.type === 'Доход');
     if (isFact) {
       const del = document.createElement('button');
@@ -831,19 +866,20 @@ function dayCard(date, g) {
     ul.appendChild(li);
   };
 
-  g.plans.forEach((t) => row(t, false));
-  if (g.plans.length && g.facts.length) {
+  const open = g.plans.filter((t) => t.left == null || t.left > 0);   // оплаченные планы не показываем
+  open.forEach((t) => row(t, false));
+  if (open.length && g.facts.length) {
     const sep = document.createElement('li');
     sep.className = 'sep';
     ul.appendChild(sep);
   }
   g.facts.forEach((t) => row(t, true));
-  if (!g.plans.length && !g.facts.length) emptyRow(ul, 'Ничего не запланировано');
+  if (!open.length && !g.facts.length) emptyRow(ul, g.plans.length ? 'План оплачен' : 'Ничего не запланировано');
 
-  const planOut = g.plans.filter((t) => t.type === 'Расход').reduce((s, t) => s + t.amount, 0);
-  if (planOut) {
-    const factOut = g.facts.filter((t) => t.type === 'Расход').reduce((s, t) => s + t.amount, 0);
-    const left = planOut - factOut;
+  // Остаток плана дня — неоплаченная часть планов расходов (факты уже зачтены в покрытие)
+  const openOut = open.filter((t) => t.type === 'Расход');
+  if (openOut.length) {
+    const left = openOut.reduce((s, t) => s + (t.left == null ? t.amount : t.left), 0);
     const foot = document.createElement('li');
     foot.className = 'total' + (left < 0 ? ' neg' : '');
     foot.innerHTML = '<span class="what">Остаток плана</span><span class="sum"></span>';
@@ -855,8 +891,8 @@ function dayCard(date, g) {
 
 function prefillFromPlan(p, dayFacts) {
   // Предлагаем то, что по этой категории в этот день ещё не потрачено.
-  const spent = (dayFacts || []).filter((f) => f.category === p.category).reduce((s, f) => s + f.amount, 0);
-  const rest = p.amount - spent;
+  const rest = p.left != null ? p.left
+    : p.amount - (dayFacts || []).filter((f) => f.category === p.category).reduce((s, f) => s + f.amount, 0);
   state.editing = null;
   state.type = p.type;
   state.category = p.category;

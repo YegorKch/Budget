@@ -204,6 +204,8 @@ h2 { font-size: 15px; color: var(--muted); font-weight: 600; margin: 14px 0 0; }
 .forecast .verdict { font-weight: 700; padding-top: 4px; border-top: 1px solid var(--line); }
 .forecast .verdict.ok { color: var(--income); }
 .forecast .verdict.bad { color: var(--danger); }
+.forecast .f-alt { color: var(--muted); font-size: 14px; }
+.forecast .f-late { color: var(--warn); font-size: 14px; font-weight: 600; }
 .section-toggle { border: 0; background: none; color: var(--muted); font-weight: 600; font-size: 15px; text-align: left; padding: 10px 0 0; display: flex; justify-content: space-between; }
 .section-toggle[aria-expanded=true] span { display: inline-block; transform: rotate(180deg); }
 .list li.env { flex-direction: column; align-items: stretch; gap: 6px; }

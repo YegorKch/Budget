@@ -19,10 +19,11 @@ const SHEET_PLAN_CAL = 'Календарь план';
 const SHEET_ARCHIVE = 'Архив';
 // Период бюджета: с этого числа месяца по число перед ним в следующем месяце (10.10–09.11).
 const PERIOD_START_DAY = 10;
-// «Календарь план»: строка с датами, первая строка категорий, первая колонка дней (F)
+// «Календарь план»: строка с датами, первая строка категорий, колонка «Надёжность» (F), первая колонка дней (G)
 const PC_HEAD = 4;
 const PC_FIRST = 7;
-const PC_DAY_COL = 6;
+const PC_REL_COL = 6;
+const PC_DAY_COL = 7;
 const HISTORY_DAYS = 60;      // сколько хранить историю сверок счетов
 
 const TX_COLS = ['ID', 'Дата', 'Статус', 'Тип', 'Сумма', 'Категория', 'Счёт', 'Кто', 'Комментарий', 'Создано', 'На счёт'];
@@ -38,6 +39,14 @@ const MANDATORY_DEFAULT = ['Рассрочки', 'Арина рассрочки'
   'Домашний интернет', 'Сбережения', 'Арина англ', 'Тренер Арине', 'Подписки/Тарифы'];
 // Ежедневные статьи (пометка «да» в «Справочниках», колонка E) — по их темпу прогноз считает, хватит ли денег
 const DAILY_DEFAULT = ['Поесть', 'Такси', 'Общественный транспорт', 'Продукты'];
+// Надёжность доходов («Справочники», колонка G): гарантированные входят в прогноз, ожидаемые — отдельной строкой
+const GUARANTEED = 'Гарантировано';
+const EXPECTED = 'Ожидается';
+const GUARANTEED_DEFAULT = ['Зп', 'Стипендия', 'Пособие'];
+// Зарплата приходит до 10-го, и обязательные платежи с неё часто оплачиваются сразу. Поэтому для гарантированных
+// доходов и обязательных статей период сдвинут на столько дней раньше (05.10–04.11 вместо 10.10–09.11):
+// зарплата 06.11 и рассрочки, оплаченные 06.11, — уже деньги следующего периода и закрывают его план.
+const NEXT_INCOME_DAYS = 5;
 
 // ---------- HTTP ----------
 
@@ -104,11 +113,11 @@ function snapshot_() {
 
 /**
  * Ключ → значение из колонки C/B «Свода» и таблица по категориям
- * (A категория, B тип, C план, D факт, H осталось по плану, M обязательная, N ежедневная).
+ * (A категория, B тип, C план, D факт, H осталось по плану, M обязательная, N ежедневная, O надёжность дохода).
  */
 function readSummary_(ss, tz) {
   const sh = ss.getSheetByName(SHEET_SUMMARY);
-  const data = sh.getRange(1, 1, sh.getLastRow(), Math.min(14, sh.getMaxColumns())).getValues();
+  const data = sh.getRange(1, 1, sh.getLastRow(), Math.min(15, sh.getMaxColumns())).getValues();
   const values = {};
   const topRaw = [];
   const byCategory = {};
@@ -130,7 +139,8 @@ function readSummary_(ss, tz) {
       // Одно имя может быть и доходом, и расходом («Прочие») — ключ с типом.
       byCategory[cat + '|' + type] = { type: type, plan: num_(plan), fact: num_(fact) };
       table.push({ name: String(cat), type: type, plan: num_(plan), fact: num_(fact),
-        left: num_(data[i][7]), mandatory: data[i][12] === 'да', daily: data[i][13] === 'да' });
+        left: num_(data[i][7]), mandatory: data[i][12] === 'да', daily: data[i][13] === 'да',
+        guaranteed: data[i][14] === GUARANTEED });
     }
   }
   return {
@@ -651,7 +661,9 @@ function fixFormulas() {
     const sh = ss.getSheetByName(SHEET_ACCOUNTS);
     if (!sh || !isAccountsV3_(sh)) throw new Error('Сначала запусти migrateAccountsV3');
     writeAccountFormulas_(sh);
-    writeSummaryFormulas_(ss.getSheetByName(SHEET_SUMMARY));
+    const sv = ss.getSheetByName(SHEET_SUMMARY);
+    writeSummaryFormulas_(sv);
+    if (summaryKeyRow_(sv, 'lifeMoney')) writeForecastFormulas_(sv);
     SpreadsheetApp.flush();
     const bad = sh.getRange(2, 1, 30, 8).getDisplayValues().flat().filter((v) => /^#/.test(v)).length;
     Logger.log(bad ? `Формулы перезаписаны, но ошибок всё ещё ${bad} — пришли текст ошибки из ячейки «Счета»!A2`
@@ -856,7 +868,8 @@ function writeCategoryTableFormulas_(sv) {
     const i = k + 2;   // строка «Справочников»
     const a = `$A${r}`;
     const base = `${T}!$E:$E,${T}!$F:$F,${a},${T}!$D:$D,$B${r}`;
-    const period = `${T}!$B:$B,">="&${ps},${T}!$B:$B,"<="&${pe}`;
+    // Сдвиг периода (колонка P): у гарантированных доходов и обязательных статей — на NEXT_INCOME_DAYS раньше
+    const period = `${T}!$B:$B,">="&(${ps}-N($P${r})),${T}!$B:$B,"<="&(${pe}-N($P${r}))`;
     const blank = `IF(${a}="","",`;
     cde.push([
       `=${blank}SUMIFS(${base},${T}!$C:$C,"План",${period}))`,
@@ -881,6 +894,26 @@ function writeCategoryTableFormulas_(sv) {
   sv.setColumnWidth(12, 100);
   sv.setColumnWidth(13, 100);
   sv.setColumnWidth(14, 100);
+
+  // O — надёжность дохода; P — сдвиг периода в днях; Q — факт в «окне» (уже деньги следующего периода).
+  sv.getRange(head, 15, 1, 3).setValues([['Надёжность', 'Сдвиг периода, дн.', 'Факт для след. периода']])
+    .setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#37474F').setWrap(true);
+  sv.getRange(head + 1, 15, 100, 1).clearContent();
+  sv.getRange(head + 1, 15).setFormula(`=ARRAYFORMULA(IF($B${head + 1}:$B${head + 100}<>"Доход","",` +
+    `IF('Справочники'!G2:G101="${GUARANTEED}","${GUARANTEED}","${EXPECTED}")))`);
+  const pq = [];
+  for (let k = 0; k < 100; k++) {
+    const r = head + 1 + k;
+    const base = `${T}!$E:$E,${T}!$F:$F,$A${r},${T}!$D:$D,$B${r}`;
+    pq.push([
+      `=IF($A${r}="","",IF(OR($M${r}="да",$O${r}="${GUARANTEED}"),${NEXT_INCOME_DAYS},0))`,
+      `=IF(OR($A${r}="",N($P${r})=0),"",SUMIFS(${base},${T}!$C:$C,"Факт",` +
+      `${T}!$B:$B,">"&(${pe}-$P${r}),${T}!$B:$B,"<="&${pe}))`,
+    ]);
+  }
+  sv.getRange(head + 1, 16, 100, 2).setFormulas(pq);
+  sv.getRange(head + 1, 17, 100, 1).setNumberFormat('#,##0;-#,##0;""');
+  sv.setColumnWidths(15, 3, 110);
 }
 
 /**
@@ -890,25 +923,35 @@ function writeCategoryTableFormulas_(sv) {
  * они уменьшают остаток на счетах, когда случаются, и прогноз пересчитывается.
  */
 function writeForecastFormulas_(sv) {
-  const data = sv.getRange(1, 1, sv.getLastRow(), 2).getValues();
-  const head = data.findIndex((r) => r[0] === 'Категория' && r[1] === 'Тип') + 1;
-  const first = head + 1;
-  const lastRow = first + 99;
-  const col = (c) => `$${c}$${first}:$${c}$${lastRow}`;
+  // Адрес таблицы категорий — каждый раз заново: вставка строк прогноза сдвигает её вниз.
+  const col = (c) => {
+    const head = sv.getRange(1, 1, sv.getLastRow(), 2).getValues()
+      .findIndex((r) => r[0] === 'Категория' && r[1] === 'Тип') + 1;
+    return `$${c}$${head + 1}:$${c}$${head + 100}`;
+  };
   const cell = (key) => `$B$${summaryKeyRow_(sv, key)}`;
   const start = summaryKeyRow_(sv, 'savingsForecast') + 1;
   const rows = [
     ['', '', '', ''],
     ['Прогноз до конца периода', '', '', ''],
     ['Начало следующего периода', `=${cell('periodEnd')}+1`, 'payday', 'День после конца периода'],
+    ['С этой даты зарплата и обязательные платежи — уже следующий период', '', 'nextIncomeFrom',
+      `Последние ${NEXT_INCOME_DAYS} дней: зарплата приходит до 10-го, обязательное с неё платится сразу`],
     ['Деньги на ежедневное до конца периода', '', 'lifeMoney',
-      'На счетах + ожидаемые доходы − все ещё не оплаченные планы, кроме ежедневных статей'],
+      'На счетах + гарантированные доходы, что ещё придут, − все неоплаченные планы, кроме ежедневных'],
     ['Можно тратить в день на ежедневное', '', 'dailyBudget', 'Деньги на ежедневное / дней осталось'],
     ['Темп ежедневных трат за 7 дней, ₸/день', '', 'pace7',
       'Статьи с «да» в «Справочниках», колонка E «Ежедневная»; 7 полных дней до сегодня'],
     ['При таком темпе деньги закончатся', '', 'runOutDate', 'Пусто — темп нулевой'],
-    ['Прогноз к концу периода: запас (+) / нехватка (−)', '', 'forecastGap', 'Деньги на жизнь − темп × дней осталось'],
+    ['Прогноз к концу периода: запас (+) / нехватка (−)', '', 'forecastGap', 'Деньги на ежедневное − темп × дней осталось'],
+    ['Ожидается (не гарантировано) до конца периода', '', 'expectedLeft', 'Доходы с пометкой «Ожидается»: долги, подработки'],
+    ['Можно в день, если придёт ожидаемое', '', 'dailyBudgetMax', '(Деньги на ежедневное + ожидаемое) / дней осталось'],
+    ['Запас / нехватка, если придёт ожидаемое', '', 'forecastGapMax', ''],
   ];
+  // Блок мог быть короче (до v5) — добавляем недостающие строки, чтобы не затереть «Топ-5» ниже
+  const oldEnd = summaryKeyRow_(sv, 'forecastGap');
+  const have = oldEnd ? oldEnd - start + 1 : 0;
+  if (have && have < rows.length) sv.insertRowsAfter(oldEnd, rows.length - have);
   sv.getRange(start, 1, rows.length, 4).setValues(rows.map((r) => [r[0], r[1] && !r[1].startsWith('=') ? r[1] : '', r[2], r[3]]));
   sv.getRange(start + 1, 1).setFontWeight('bold').setFontSize(12);
   const set = (key, f, fmt) => {
@@ -918,13 +961,59 @@ function writeForecastFormulas_(sv) {
     sv.getRange(r, 4).setFontStyle('italic').setFontColor('#777777');
   };
   set('payday', `=${cell('periodEnd')}+1`, 'dd.mm.yyyy');
-  set('lifeMoney', `=ROUND(${cell('balanceNow')}+SUMIF(${col('B')},"Доход",${col('H')})` +
-    `-SUMIFS(${col('H')},${col('B')},"Расход",${col('N')},"<>да"),0)`, '#,##0');
+  set('nextIncomeFrom', `=${cell('periodEnd')}-${NEXT_INCOME_DAYS - 1}`, 'dd.mm.yyyy');
+  writeCategoryTableFormulas_(sv);
+  // Деньги периода: на счетах − доход, уже пришедший для следующего периода + обязательное, уже оплаченное за него
+  // + гарантированные доходы, что ещё придут в этом периоде
+  const money = `${cell('balanceNow')}-SUMIF(${col('B')},"Доход",${col('Q')})+SUMIF(${col('B')},"Расход",${col('Q')})` +
+    `+SUMIFS(${col('H')},${col('B')},"Доход",${col('O')},"${GUARANTEED}")`;
+  set('lifeMoney', `=ROUND(${money}-SUMIFS(${col('H')},${col('B')},"Расход",${col('N')},"<>да"),0)`, '#,##0');
+  const fr = summaryKeyRow_(sv, 'freeNow');
+  sv.getRange(fr, 2).setFormula(`=${money}-SUMIF(${col('B')},"Расход",${col('H')})`);
+  sv.getRange(fr, 4).setValue('На счетах + гарантированные доходы, что ещё придут, − все неоплаченные планы');
   set('dailyBudget', `=ROUND(${cell('lifeMoney')}/${cell('daysLeft')},0)`, '#,##0');
   set('pace7', `=ROUND(SUMIFS(${col('L')},${col('B')},"Расход",${col('N')},"да")/7,0)`, '#,##0');
   set('runOutDate', `=IF(${cell('pace7')}<=0,"",IF(${cell('lifeMoney')}<=0,TODAY(),` +
     `TODAY()+INT(${cell('lifeMoney')}/${cell('pace7')})))`, 'dd.mm.yyyy');
   set('forecastGap', `=ROUND(${cell('lifeMoney')}-${cell('pace7')}*${cell('daysLeft')},0)`, '#,##0;-#,##0');
+  set('expectedLeft', `=SUMIFS(${col('H')},${col('B')},"Доход",${col('O')},"${EXPECTED}")`, '#,##0');
+  set('dailyBudgetMax', `=ROUND((${cell('lifeMoney')}+${cell('expectedLeft')})/${cell('daysLeft')},0)`, '#,##0');
+  set('forecastGapMax', `=ROUND(${cell('lifeMoney')}+${cell('expectedLeft')}-${cell('pace7')}*${cell('daysLeft')},0)`,
+    '#,##0;-#,##0');
+}
+
+/**
+ * v4 → v5: надёжность доходов. Запустить один раз; повторно — безопасно.
+ * 1. «Справочники»: колонка G «Надёжность» у доходов — «Гарантировано» (Зп, Стипендия, Пособие) или «Ожидается».
+ * 2. «Свод»: колонки O–Q, прогноз и «Свободно» считают только гарантированные доходы; гарантированный доход
+ *    за последние NEXT_INCOME_DAYS дней периода — деньги следующего периода; ожидаемое — отдельной строкой.
+ */
+function migrateV5() {
+  withEnglishLocale_(() => {
+    const ss = SpreadsheetApp.getActive();
+    const ref = ss.getSheetByName(SHEET_REF);
+    const sv = ss.getSheetByName(SHEET_SUMMARY);
+    const log = [];
+    if (ref.getRange('G1').getValue() !== 'Надёжность') {
+      ref.getRange('G1').setValue('Надёжность');
+      ref.getRange('A1').copyFormatToRange(ref, 7, 7, 1, 1);
+      const n = Math.max(ref.getLastRow() - 1, 1);
+      const names = ref.getRange(2, 1, n, 2).getValues();
+      ref.getRange(2, 7, n, 1).setValues(names.map((r) => [r[1] !== 'Доход' ? ''
+        : GUARANTEED_DEFAULT.indexOf(String(r[0])) >= 0 ? GUARANTEED : EXPECTED]));
+      ref.getRange(2, 7, Math.min(ref.getMaxRows() - 1, 499), 1).setDataValidation(
+        SpreadsheetApp.newDataValidation().requireValueInList([GUARANTEED, EXPECTED], true).setAllowInvalid(true).build());
+      ref.setColumnWidth(7, 120);
+      log.push('Справочники: колонка «Надёжность»');
+    }
+    writeCategoryTableFormulas_(sv);
+    writeForecastFormulas_(sv);
+    SpreadsheetApp.flush();
+    log.push('Свод: прогноз и «Свободно» — по гарантированным доходам, ожидаемое отдельно');
+    rebuildPlanCalendar();
+    log.push('Календарь план: колонка «Надёжность»');
+    Logger.log(log.join('; '));
+  });
 }
 
 // ---------- Период и архив ----------
@@ -1035,8 +1124,25 @@ function onEdit(e) {
   if (!e || !e.range) return;
   const sh = e.range.getSheet();
   if (sh.getName() !== SHEET_PLAN_CAL) return;
-  if (e.range.getLastRow() < PC_FIRST || e.range.getLastColumn() < PC_DAY_COL) return;
-  syncPlanCells_(sh, e.range);
+  if (e.range.getLastRow() < PC_FIRST) return;
+  if (e.range.getColumn() <= PC_REL_COL && e.range.getLastColumn() >= PC_REL_COL) syncReliability_(sh, e.range);
+  if (e.range.getLastColumn() >= PC_DAY_COL) syncPlanCells_(sh, e.range);
+}
+
+/** Надёжность дохода, изменённая в «Календаре план», записывается в «Справочники» (колонка G). */
+function syncReliability_(sh, range) {
+  const ss = sh.getParent();
+  const ref = ss.getSheetByName(SHEET_REF);
+  const r0 = Math.max(range.getRow(), PC_FIRST);
+  const rows = sh.getRange(r0, 1, range.getLastRow() - r0 + 1, PC_REL_COL).getValues();
+  const n = Math.max(ref.getLastRow() - 1, 1);
+  const refv = ref.getRange(2, 1, n, 2).getValues();
+  rows.forEach((r) => {
+    const v = r[PC_REL_COL - 1];
+    if (r[1] !== 'Доход' || [GUARANTEED, EXPECTED].indexOf(v) < 0) return;
+    const i = refv.findIndex((x) => String(x[0]).trim().toLowerCase() === String(r[0]).trim().toLowerCase() && x[1] === 'Доход');
+    if (i >= 0) ref.getRange(i + 2, 7).setValue(v);
+  });
 }
 
 /** Перестраивает «Календарь план» из плановых строк «Транзакций» на текущий период «Свода». */
@@ -1052,9 +1158,14 @@ function rebuildPlanCalendar() {
     for (let d = ymd_(ps, tz); d <= ymd_(pe, tz); d = addDays_(d, 1)) days.push(d);
 
     // Категории: сначала доходы, потом расходы — в порядке справочника
-    const refRows = ss.getSheetByName(SHEET_REF).getRange(2, 1, 200, 2).getValues().filter((r) => r[0]);
+    const refRows = ss.getSheetByName(SHEET_REF).getRange(2, 1, 200, 7).getValues().filter((r) => r[0]);
     const cats = refRows.filter((r) => r[1] === 'Доход').concat(refRows.filter((r) => r[1] !== 'Доход'))
-      .map((r) => ({ name: String(r[0]), type: r[1] || 'Расход' }));
+      .map((r) => {
+        const rel = r[1] === 'Доход' ? (r[6] || EXPECTED) : '';
+        // Сдвиг периода — как на «Своде»: гарантированные доходы и обязательные статьи
+        const shift = (r[1] === 'Доход' ? rel === GUARANTEED : r[2] === 'да') ? NEXT_INCOME_DAYS : 0;
+        return { name: String(r[0]), type: r[1] || 'Расход', rel: rel, shift: shift };
+      });
 
     // Планы по дням
     const plan = {};
@@ -1083,10 +1194,11 @@ function rebuildPlanCalendar() {
     sh.getRange(1, 1).setValue('Календарь план').setFontWeight('bold').setFontSize(14);
     sh.getRange(2, 1).setValue('Впиши плановые суммы в ячейки дней — они сразу попадут в план. ' +
       'Серые зачёркнутые — уже покрыты фактом, оранжевые — покрыты частично. ' +
-      '«Осталось» красным — по статье потрачено больше плана, заложи ещё.').setFontStyle('italic').setFontColor('#777777');
+      '«Осталось» красным — по статье потрачено больше плана, заложи ещё. ' +
+      '«Надёжность» у доходов: «Гарантировано» входит в прогноз, «Ожидается» — нет.').setFontStyle('italic').setFontColor('#777777');
 
     // Шапка
-    const head = ['Категория', 'Тип', 'План', 'Потрачено', 'Осталось'].concat(days.map((d) => parseYmd_(d)));
+    const head = ['Категория', 'Тип', 'План', 'Потрачено', 'Осталось', 'Надёжность'].concat(days.map((d) => parseYmd_(d)));
     sh.getRange(PC_HEAD, 1, 1, head.length).setValues([head])
       .setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#37474F').setHorizontalAlignment('center');
     sh.getRange(PC_HEAD, PC_DAY_COL, 1, days.length).setNumberFormat('dd.mm');
@@ -1098,7 +1210,7 @@ function rebuildPlanCalendar() {
     const tot = [['Итого доходы', 'Доход'], ['Итого расходы', 'Расход']].map(([label, type]) =>
       [label, '', `=SUMIF($B$${PC_FIRST}:$B$${lastRow},"${type}",C${PC_FIRST}:C${lastRow})`,
         `=SUMIF($B$${PC_FIRST}:$B$${lastRow},"${type}",D${PC_FIRST}:D${lastRow})`,
-        `=SUMIF($B$${PC_FIRST}:$B$${lastRow},"${type}",E${PC_FIRST}:E${lastRow})`]
+        `=SUMIF($B$${PC_FIRST}:$B$${lastRow},"${type}",E${PC_FIRST}:E${lastRow})`, '']
         .concat(days.map((_, i) => {
           const c = colLetter_(PC_DAY_COL + i);
           return `=SUMIF($B$${PC_FIRST}:$B$${lastRow},"${type}",${c}${PC_FIRST}:${c}${lastRow})`;
@@ -1114,14 +1226,21 @@ function rebuildPlanCalendar() {
       return [c.name, c.type,
         `=SUM(${firstDay}${r}:${lastCol}${r})`,
         `=SUMIFS(${T}!$E:$E,${T}!$F:$F,$A${r},${T}!$D:$D,$B${r},${T}!$C:$C,"Факт",` +
-        `${T}!$B:$B,">="&$${firstDay}$${PC_HEAD},${T}!$B:$B,"<="&$${lastCol}$${PC_HEAD})`,
-        `=C${r}-D${r}`]
+        `${T}!$B:$B,">="&($${firstDay}$${PC_HEAD}-${c.shift}),${T}!$B:$B,"<="&($${lastCol}$${PC_HEAD}-${c.shift}))`,
+        `=C${r}-D${r}`, c.rel]
         .concat(days.map((d) => plan[c.name.toLowerCase() + '|' + c.type + '|' + d] || ''));
     });
     if (n) {
       sh.getRange(PC_FIRST, 1, n, 2).setValues(rows.map((r) => r.slice(0, 2)));
       sh.getRange(PC_FIRST, 3, n, 3).setFormulas(rows.map((r) => r.slice(2, 5).map(F)));
-      sh.getRange(PC_FIRST, PC_DAY_COL, n, days.length).setValues(rows.map((r) => r.slice(5)));
+      sh.getRange(PC_FIRST, PC_REL_COL, n, 1).setValues(rows.map((r) => [r[5]]));
+      // Выпадающий список надёжности — только у доходов
+      const relRule = SpreadsheetApp.newDataValidation().requireValueInList([GUARANTEED, EXPECTED], true)
+        .setAllowInvalid(false).build();
+      cats.forEach((c, i) => {
+        if (c.type === 'Доход') sh.getRange(PC_FIRST + i, PC_REL_COL).setDataValidation(relRule).setBackground('#FFF8E1');
+      });
+      sh.getRange(PC_FIRST, PC_DAY_COL, n, days.length).setValues(rows.map((r) => r.slice(6)));
       sh.getRange(PC_FIRST, PC_DAY_COL, n, days.length).setBackground('#E3F2FD');
     }
     sh.getRange(PC_HEAD + 1, 3, n + 2, head.length - 2).setNumberFormat('#,##0;-#,##0;""');
@@ -1148,10 +1267,11 @@ function rebuildPlanCalendar() {
     sh.setConditionalFormatRules(rules);
 
     sh.setFrozenRows(PC_HEAD + 2);
-    sh.setFrozenColumns(5);
+    sh.setFrozenColumns(PC_REL_COL);
     sh.setColumnWidth(1, 190);
     sh.setColumnWidth(2, 60);
     for (let c = 3; c <= 5; c++) sh.setColumnWidth(c, 85);
+    sh.setColumnWidth(PC_REL_COL, 115);
     sh.setColumnWidths(PC_DAY_COL, days.length, 62);
     sh.getRange(PC_HEAD, 3, 1, 3).setNote('План / Потрачено / Осталось — за весь период со «Свода»');
   }
