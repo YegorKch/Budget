@@ -207,6 +207,10 @@ h2 { font-size: 15px; color: var(--muted); font-weight: 600; margin: 14px 0 0; }
 .cat-list li { padding: 13px 4px; border-bottom: 1px solid var(--line); }
 .cat-list li.sep { padding: 10px 4px 4px; color: var(--muted); font-size: 13px; border: 0; }
 .cat-list li.new { color: var(--accent); font-weight: 600; }
+.cat-list li.acc-pick { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 15px 4px; }
+.cat-list li.acc-pick small { color: var(--muted); font-variant-numeric: tabular-nums; }
+.cat-list li.acc-pick.on { color: var(--accent); font-weight: 600; }
+.row.two .date-pill { flex: 1; justify-content: center; }
 .cat-list li:active { background: var(--chip); }
 
 .toast {

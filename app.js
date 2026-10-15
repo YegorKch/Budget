@@ -64,9 +64,14 @@ function currentNav() { return history.state || { screen: 'entry' }; }
 window.addEventListener('popstate', (e) => {
   const s = e.state || { screen: 'entry' };
   $('cat-sheet').hidden = true;
+  $('acc-sheet').hidden = true;
   if (!s.sub && (state.editing || state.fromPlan)) resetEntry();   // ушли из режима правки без сохранения
   show(s.screen);
   if (s.screen === 'summary') renderSummary();
+  // Выбор в листе делается после того, как лист закрылся: иначе два history.back() подряд.
+  const after = state.afterSheet;
+  state.afterSheet = null;
+  if (after) after();
 });
 
 let toastTimer;
@@ -218,7 +223,6 @@ function renderEntry() {
   for (const b of $('type-seg').children) b.classList.toggle('on', b.dataset.v === state.type);
   $('chips').hidden = isT;
   $('transfer').hidden = !isT;
-  $('account').hidden = isT;
   $('plan-toggle').hidden = isT;
   const d = $('date').value || todayYmd();
   $('date-label').textContent = dateLabel(d);
@@ -240,10 +244,12 @@ function press(k) {
   renderEntry();
 }
 
-function save() {
+function save(account) {
   if ($('save').disabled) return;
   const amount = Number(state.amount);
   const isT = state.type === TRANSFER;
+  // Факт расхода/дохода: счёт выбирается в листе после «Записать». План и перевод — без листа.
+  if (!isT && !state.plan && account === undefined) return openAccountSheet();
   const fields = isT ? {
     date: $('date').value || todayYmd(),
     status: 'Факт',
@@ -259,7 +265,7 @@ function save() {
     type: state.type,
     amount: amount,
     category: state.category,
-    account: $('account').value,
+    account: state.plan ? '' : account,
     toAccount: '',
     comment: $('comment').value.trim(),
   };
@@ -277,7 +283,7 @@ function save() {
     toast(`Изменено: ${money(amount)} · ${label}`);
   } else {
     const tx = Object.assign({ id: uid(), who: state.who }, fields);
-    if (!isT) LS.set('lastAccount', tx.account);
+    if (!isT && tx.account) LS.set('lastAccount', tx.account);
     enqueue({ op: 'add', tx: tx, at: Date.now() });
     toast(`${isT ? 'Перевод' : tx.status === 'План' ? 'В план' : 'Записано'}: ${money(amount)} · ${label}`);
   }
@@ -354,6 +360,27 @@ function openCategorySheet() {
   $('cat-sheet').hidden = false;
   history.pushState(Object.assign({}, currentNav(), { sheet: true }), '');
 }
+function openAccountSheet() {
+  const list = $('acc-list');
+  list.innerHTML = '';
+  const accounts = (state.snap && state.snap.accounts) || [];
+  const bal = currentBalances();
+  const cur = (state.editing && state.editing.account) || LS.get('lastAccount', '') ||
+    (state.who === 'Арина' ? 'Kaspi Арина' : 'Kaspi Егор');
+  $('acc-sheet-title').textContent = state.type === 'Доход' ? 'На какой счёт?' : 'С какого счёта?';
+  for (const a of accounts) {
+    const li = document.createElement('li');
+    li.className = 'acc-pick' + (a === cur ? ' on' : '');
+    li.innerHTML = '<span></span><small></small>';
+    li.querySelector('span').textContent = a;
+    li.querySelector('small').textContent = a in bal ? money(bal[a]) : '';
+    li.onclick = () => { state.afterSheet = () => save(a); history.back(); };
+    list.appendChild(li);
+  }
+  $('acc-sheet').hidden = false;
+  history.pushState(Object.assign({}, currentNav(), { sheet: true }), '');
+}
+
 function closeSheet() {
   if ($('cat-sheet').hidden) return;
   if (currentNav().sheet) history.back();   // popstate сам закроет лист
@@ -706,7 +733,7 @@ function bind() {
     if ($('entry').hidden || e.target.tagName === 'INPUT') return;
     if (/^\d$/.test(e.key)) press(e.key);
     else if (e.key === 'Backspace') press('back');
-    else if (e.key === 'Enter' && !$('save').disabled) save();
+    else if (e.key === 'Enter' && !$('save').disabled && $('acc-sheet').hidden) save();
   });
   $('type-seg').addEventListener('click', (e) => {
     const v = e.target.dataset.v;
@@ -723,7 +750,7 @@ function bind() {
   $('plan-toggle').onclick = () => { state.plan = !state.plan; renderEntry(); };
   $('date').addEventListener('change', renderEntry);
   $('comment').addEventListener('keydown', (e) => { if (e.key === 'Enter') e.target.blur(); });
-  $('save').onclick = save;
+  $('save').onclick = () => save();
   $('edit-cancel').onclick = () => history.back();
   $('today-chip').onclick = () => {
     if (currentNav().sub) history.back(); else { go('summary'); renderSummary(); }
@@ -738,6 +765,9 @@ function bind() {
   $('setup-save').onclick = saveSetup;
   $('setup-cancel').onclick = () => history.back();
   $('cat-sheet').addEventListener('click', (e) => { if (e.target.id === 'cat-sheet' || e.target.dataset.close != null) closeSheet(); });
+  $('acc-sheet').addEventListener('click', (e) => {
+    if ((e.target.id === 'acc-sheet' || e.target.dataset.close != null) && currentNav().sheet) history.back();
+  });
 
   window.addEventListener('online', () => { flush(); refresh(); });
   window.addEventListener('offline', () => renderStamp(true));

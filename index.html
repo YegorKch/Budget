@@ -68,7 +68,7 @@
       <input id="comment" type="text" enterkeyhint="done" autocomplete="off" placeholder="Комментарий">
     </div>
     <div class="row two">
-      <select id="account" aria-label="Счёт"></select>
+      <select id="account" aria-label="Счёт" hidden></select>
       <label class="date-pill">
         <span id="date-label">Сегодня</span>
         <input id="date" type="date" aria-label="Дата">
@@ -123,6 +123,14 @@
     <div class="sheet-body">
       <div class="sheet-head"><b>Категория</b><button class="icon" type="button" data-close>✕</button></div>
       <ul class="cat-list" id="cat-list"></ul>
+    </div>
+  </div>
+
+  <!-- Выбор счёта после «Записать» -->
+  <div class="sheet" id="acc-sheet" hidden>
+    <div class="sheet-body">
+      <div class="sheet-head"><b id="acc-sheet-title">С какого счёта?</b><button class="icon" type="button" data-close>✕</button></div>
+      <ul class="cat-list" id="acc-list"></ul>
     </div>
   </div>
 
