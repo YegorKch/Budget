@@ -593,12 +593,15 @@ function renderForecast() {
   const runOut = sm.runOutDate ? shortDate(sm.runOutDate) : '';
   box.innerHTML = '';
   const add = (cls, html) => { const d = document.createElement('div'); d.className = cls; d.innerHTML = html; box.appendChild(d); };
-  add('f-title', `Еда, такси, транспорт · до ${sm.payday ? shortDate(sm.payday) : 'конца периода'} · ${sm.daysLeft} дн. · ` +
-    `есть ${money(sm.lifeMoney)}`);
+  // Период кончается в день зарплаты — она придёт в окне nextIncomeFrom…periodEnd; считаем по худшему случаю
+  const until = sm.nextIncomeFrom && sm.periodEnd
+    ? `до зарплаты ${shortDate(sm.nextIncomeFrom)}–${shortDate(sm.periodEnd)}`
+    : `до ${sm.payday ? shortDate(sm.payday) : 'конца периода'}`;
+  add('f-title', `Еда, такси, транспорт · ${until} · ${sm.daysLeft} дн. · есть ${money(sm.lifeMoney)}`);
   add('f-row', `<span>Можно тратить в день</span><b>${money(sm.dailyBudget)}</b>`);
   add('f-row', `<span>Тратите сейчас (за 7 дней)</span><b>${money(sm.pace7)}</b>`);
   add('verdict ' + (ok ? 'ok' : 'bad'), ok
-    ? `Хватит до ${sm.payday ? shortDate(sm.payday) : 'конца периода'}, запас ≈ ${money(gap)}`
+    ? `Хватит до зарплаты, запас ≈ ${money(gap)}`
     : `Не хватит ≈ ${money(-gap)}${runOut ? ' · деньги закончатся ~' + runOut : ''}`);
   // Ожидаемые (не гарантированные) доходы — отдельной строкой «а если придут»
   const exp = Number(sm.expectedLeft) || 0;
@@ -817,6 +820,17 @@ function renderReport() {
  * Оплатил рассрочки 06-го при плане на 10-е — план 10-го исчезает из ленты.
  */
 function markPlanCoverage(plans) {
+  // Ежедневные статьи (еда, такси, транспорт) — день за днём: план дня гасят только траты этого дня
+  const daily = new Set(((state.snap && state.snap.categoryTable) || []).filter((c) => c.daily).map((c) => c.name + '|' + c.type));
+  const dayFact = {};
+  feedData().facts.forEach((t) => {
+    const k = t.category + '|' + t.type + '|' + t.date;
+    dayFact[k] = (dayFact[k] || 0) + t.amount;
+  });
+  plans.filter((p) => daily.has(p.category + '|' + p.type)).forEach((p) => {
+    p.left = Math.max(0, p.amount - (dayFact[p.category + '|' + p.type + '|' + p.date] || 0));
+  });
+
   const fact = {};
   ((state.snap && state.snap.categoryTable) || []).forEach((c) => { fact[c.name + '|' + c.type] = c.fact; });
   state.queue.filter((q) => q.op === 'add' && q.tx.status === 'Факт').forEach(({ tx }) => {
@@ -825,6 +839,7 @@ function markPlanCoverage(plans) {
   });
   plans.slice().sort((a, b) => a.date.localeCompare(b.date)).forEach((p) => {
     const k = p.category + '|' + p.type;
+    if (daily.has(k)) return;
     const covered = Math.min(p.amount, Math.max(0, fact[k] || 0));
     fact[k] = (fact[k] || 0) - covered;
     p.left = p.amount - covered;

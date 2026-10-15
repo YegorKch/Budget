@@ -17,8 +17,11 @@ const SHEET_ACCOUNTS = 'Счета';
 const SHEET_HISTORY = 'История счетов';
 const SHEET_PLAN_CAL = 'Календарь план';
 const SHEET_ARCHIVE = 'Архив';
-// Период бюджета: с этого числа месяца по число перед ним в следующем месяце (10.10–09.11).
-const PERIOD_START_DAY = 10;
+// Период бюджета начинается в день зарплаты. Зарплата («Зп») приходит с 5-го по 10-е: период — с её прихода
+// и до следующей зарплаты, но не позже 10-го следующего месяца. Нет зарплаты к 10-му — новый период с 11-го.
+const SALARY_CATEGORY = 'Зп';
+const SALARY_DAY_FROM = 5;
+const SALARY_DAY_TO = 10;
 // «Календарь план»: строка с датами, первая строка категорий, колонка «Надёжность» (F), первая колонка дней (G)
 const PC_HEAD = 4;
 const PC_FIRST = 7;
@@ -43,10 +46,11 @@ const DAILY_DEFAULT = ['Поесть', 'Такси', 'Общественный �
 const GUARANTEED = 'Гарантировано';
 const EXPECTED = 'Ожидается';
 const GUARANTEED_DEFAULT = ['Зп', 'Стипендия', 'Пособие'];
-// Зарплата приходит до 10-го, и обязательные платежи с неё часто оплачиваются сразу. Поэтому для гарантированных
-// доходов и обязательных статей период сдвинут на столько дней раньше (05.10–04.11 вместо 10.10–09.11):
-// зарплата 06.11 и рассрочки, оплаченные 06.11, — уже деньги следующего периода и закрывают его план.
-const NEXT_INCOME_DAYS = 5;
+// Окно зарплаты в конце периода (с 5-го по 10-е): гарантированные доходы и обязательные платежи, что приходятся
+// на эти дни, — уже следующий период (следующая зарплата, рассрочки с неё). Прогноз текущего их не учитывает.
+const NEXT_INCOME_DAYS = SALARY_DAY_TO - SALARY_DAY_FROM + 1;
+// Пометка ежедневных статей в «Календаре план»: они сверяются с планом день за днём, а не конвертом
+const DAILY_MARK = 'ежедневная';
 
 // ---------- HTTP ----------
 
@@ -70,6 +74,7 @@ function doPost(e) {
       else if (req.action === 'setBalance') result = setBalance_(req.account, req.value, req.who);
       else throw new Error('Неизвестное действие: ' + req.action);
       SpreadsheetApp.flush();
+      ensurePeriod_(SpreadsheetApp.getActive());   // записали зарплату — новый период начинается сразу
     } finally {
       lock.releaseLock();
     }
@@ -832,7 +837,7 @@ function migrateV4() {
 
     // 4. Период с 10-го по 9-е; прошедшее — в «Архив»
     const pr = summaryKeyRow_(sv, 'periodEnd');
-    sv.getRange(pr, 1).setValue(`Конец периода (период с ${PERIOD_START_DAY}-го, сдвигается сам)`);
+    sv.getRange(pr, 1).setValue(`Конец периода (до следующей зарплаты, не позже ${SALARY_DAY_TO}-го)`);
     sv.getRange(summaryKeyRow_(sv, 'periodStart'), 1).setValue('Начало периода (сдвигается сам)');
     if (ensurePeriod_(ss)) log.push('Период переставлен, прошедшее записано в «Архив»');
 
@@ -868,8 +873,9 @@ function writeCategoryTableFormulas_(sv) {
     const i = k + 2;   // строка «Справочников»
     const a = `$A${r}`;
     const base = `${T}!$E:$E,${T}!$F:$F,${a},${T}!$D:$D,$B${r}`;
-    // Сдвиг периода (колонка P): у гарантированных доходов и обязательных статей — на NEXT_INCOME_DAYS раньше
-    const period = `${T}!$B:$B,">="&(${ps}-N($P${r})),${T}!$B:$B,"<="&(${pe}-N($P${r}))`;
+    // Окно зарплаты (колонка P): у гарантированных доходов и обязательных статей последние дни периода —
+    // уже следующий период
+    const period = `${T}!$B:$B,">="&${ps},${T}!$B:$B,"<="&(${pe}-N($P${r}))`;
     const blank = `IF(${a}="","",`;
     cde.push([
       `=${blank}SUMIFS(${base},${T}!$C:$C,"План",${period}))`,
@@ -896,7 +902,7 @@ function writeCategoryTableFormulas_(sv) {
   sv.setColumnWidth(14, 100);
 
   // O — надёжность дохода; P — сдвиг периода в днях; Q — факт в «окне» (уже деньги следующего периода).
-  sv.getRange(head, 15, 1, 3).setValues([['Надёжность', 'Сдвиг периода, дн.', 'Факт для след. периода']])
+  sv.getRange(head, 15, 1, 3).setValues([['Надёжность', 'Окно зарплаты, дн.', 'Факт для след. периода']])
     .setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#37474F').setWrap(true);
   sv.getRange(head + 1, 15, 100, 1).clearContent();
   sv.getRange(head + 1, 15).setFormula(`=ARRAYFORMULA(IF($B${head + 1}:$B${head + 100}<>"Доход","",` +
@@ -934,9 +940,10 @@ function writeForecastFormulas_(sv) {
   const rows = [
     ['', '', '', ''],
     ['Прогноз до конца периода', '', '', ''],
-    ['Начало следующего периода', `=${cell('periodEnd')}+1`, 'payday', 'День после конца периода'],
-    ['С этой даты зарплата и обязательные платежи — уже следующий период', '', 'nextIncomeFrom',
-      `Последние ${NEXT_INCOME_DAYS} дней: зарплата приходит до 10-го, обязательное с неё платится сразу`],
+    ['Начало следующего периода (не позже)', `=${cell('periodEnd')}+1`, 'payday',
+      'Новый период начнётся в день зарплаты, а если её не будет — на следующий день после конца'],
+    ['Окно зарплаты: с этой даты', '', 'nextIncomeFrom',
+      `Зарплата и обязательные платежи с ${SALARY_DAY_FROM}-го по ${SALARY_DAY_TO}-е — уже следующий период`],
     ['Деньги на ежедневное до конца периода', '', 'lifeMoney',
       'На счетах + гарантированные доходы, что ещё придут, − все неоплаченные планы, кроме ежедневных'],
     ['Можно тратить в день на ежедневное', '', 'dailyBudget', 'Деньги на ежедневное / дней осталось'],
@@ -948,8 +955,9 @@ function writeForecastFormulas_(sv) {
     ['Можно в день, если придёт ожидаемое', '', 'dailyBudgetMax', '(Деньги на ежедневное + ожидаемое) / дней осталось'],
     ['Запас / нехватка, если придёт ожидаемое', '', 'forecastGapMax', ''],
   ];
-  // Блок мог быть короче (до v5) — добавляем недостающие строки, чтобы не затереть «Топ-5» ниже
-  const oldEnd = summaryKeyRow_(sv, 'forecastGap');
+  // Блок мог быть короче (до v5) — добавляем недостающие строки, чтобы не затереть «Топ-5» ниже.
+  // Конец блока — последняя строка, что уже есть: при повторном запуске лишнее не вставляем.
+  const oldEnd = summaryKeyRow_(sv, 'forecastGapMax') || summaryKeyRow_(sv, 'forecastGap');
   const have = oldEnd ? oldEnd - start + 1 : 0;
   if (have && have < rows.length) sv.insertRowsAfter(oldEnd, rows.length - have);
   sv.getRange(start, 1, rows.length, 4).setValues(rows.map((r) => [r[0], r[1] && !r[1].startsWith('=') ? r[1] : '', r[2], r[3]]));
@@ -994,6 +1002,10 @@ function migrateV5() {
     const ref = ss.getSheetByName(SHEET_REF);
     const sv = ss.getSheetByName(SHEET_SUMMARY);
     const log = [];
+    sv.getRange(summaryKeyRow_(sv, 'periodStart'), 1).setValue('Начало периода (день зарплаты, ставится сам)');
+    sv.getRange(summaryKeyRow_(sv, 'periodEnd'), 1)
+      .setValue(`Конец периода (до следующей зарплаты, не позже ${SALARY_DAY_TO}-го)`);
+    if (ensurePeriod_(ss)) log.push('Период: с дня зарплаты');
     if (ref.getRange('G1').getValue() !== 'Надёжность') {
       ref.getRange('G1').setValue('Надёжность');
       ref.getRange('A1').copyFormatToRange(ref, 7, 7, 1, 1);
@@ -1018,13 +1030,31 @@ function migrateV5() {
 
 // ---------- Период и архив ----------
 
-/** Период, в который попадает сегодняшний день: с PERIOD_START_DAY-го по день перед ним в следующем месяце. */
-function currentPeriod_(tz) {
-  const [y, m, d] = ymd_(new Date(), tz).split('-').map(Number);
-  const sm = d >= PERIOD_START_DAY ? m : m - 1;           // месяц начала (может быть 0 = декабрь прошлого года)
-  const start = new Date(Date.UTC(y, sm - 1, PERIOD_START_DAY));
-  const next = new Date(Date.UTC(y, sm, PERIOD_START_DAY));
-  return { start: start.toISOString().slice(0, 10), end: new Date(next - 864e5).toISOString().slice(0, 10) };
+/**
+ * Текущий период: начинается в день первой зарплаты («Зп»), пришедшей с SALARY_DAY_FROM по SALARY_DAY_TO число,
+ * и длится до следующей зарплаты, но не дольше SALARY_DAY_TO-го следующего месяца. Нет зарплаты к SALARY_DAY_TO-му —
+ * период начинается на следующий день. Пока в окне зарплата не пришла, действует прошлый период.
+ */
+function currentPeriod_(ss, tz) {
+  const today = ymd_(new Date(), tz);
+  const salary = readTx_(ss).map((x) => txObj_(x.v, tz))
+    .filter((t) => t.status === 'Факт' && t.type === 'Доход' && t.date <= today &&
+      String(t.category).trim().toLowerCase() === SALARY_CATEGORY.toLowerCase())
+    .map((t) => t.date);
+  const ymd = (y, m, d) => new Date(Date.UTC(y, m - 1, d)).toISOString().slice(0, 10);
+  const startIn = (y, m) => {           // начало периода в месяце m или null, если окно ещё идёт и зарплаты нет
+    const from = ymd(y, m, SALARY_DAY_FROM);
+    const to = ymd(y, m, SALARY_DAY_TO);
+    const hit = salary.filter((d) => d >= from && d <= to).sort()[0];
+    if (hit) return hit;
+    return today > to ? addDays_(to, 1) : null;
+  };
+  let [y, m, d] = today.split('-').map(Number);
+  if (d < SALARY_DAY_FROM) m -= 1;
+  let start = startIn(y, m);
+  if (!start) start = startIn(y, m - 1);   // окно этого месяца идёт, зарплаты ещё нет — живём в прошлом периоде
+  const [sy, sm] = start.split('-').map(Number);
+  return { start: start, end: ymd(sy, sm + 1, SALARY_DAY_TO) };
 }
 
 /**
@@ -1038,10 +1068,12 @@ function ensurePeriod_(ss) {
   const re = summaryKeyRow_(sv, 'periodEnd');
   const oldStart = sv.getRange(rs, 2).getValue();
   const oldEnd = sv.getRange(re, 2).getValue();
-  const cur = currentPeriod_(tz);
+  const cur = currentPeriod_(ss, tz);
   if (isDate_(oldStart) && isDate_(oldEnd) && ymd_(oldStart, tz) === cur.start && ymd_(oldEnd, tz) === cur.end) return false;
 
-  if (isDate_(oldStart) && ymd_(oldStart, tz) < cur.start) archiveRange_(ss, ymd_(oldStart, tz), addDays_(cur.start, -1));
+  const os = isDate_(oldStart) ? ymd_(oldStart, tz) : '';
+  if (os && os < cur.start) archiveRange_(ss, os, addDays_(cur.start, -1));
+  else if (os && os > cur.start) trimArchive_(ss, cur.start);   // начало сдвинулось раньше — архив не должен его задевать
   sv.getRange(rs, 2).setValue(parseYmd_(cur.start));
   sv.getRange(re, 2).setValue(parseYmd_(cur.end));
   SpreadsheetApp.flush();
@@ -1054,8 +1086,10 @@ function ensurePeriodLocked_() {
   const ss = SpreadsheetApp.getActive();
   const tz = ss.getSpreadsheetTimeZone();
   const sv = ss.getSheetByName(SHEET_SUMMARY);
+  const start = sv.getRange(summaryKeyRow_(sv, 'periodStart'), 2).getValue();
   const end = sv.getRange(summaryKeyRow_(sv, 'periodEnd'), 2).getValue();
-  if (isDate_(end) && ymd_(new Date(), tz) <= ymd_(end, tz)) return;   // быстрый путь — период актуален
+  const cur = currentPeriod_(ss, tz);
+  if (isDate_(start) && isDate_(end) && ymd_(start, tz) === cur.start && ymd_(end, tz) === cur.end) return;
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try { ensurePeriod_(ss); } finally { lock.releaseLock(); }
@@ -1104,6 +1138,27 @@ function archiveRange_(ss, from, to) {
   sh.getRange(r0, 2, rows.length, 2).setNumberFormat('dd.mm.yyyy');
   sh.getRange(r0, 6, rows.length, 3).setNumberFormat('#,##0;-#,##0;0');
   sh.getRange(r0 + rows.length - 2, 1, 2, 8).setFontWeight('bold').setBackground('#ECEFF1');
+}
+
+/**
+ * Начало периода сдвинулось раньше конца уже записанного в «Архив» периода: блок архива, который задевает новый
+ * период, удаляется и записывается заново — до дня перед новым началом.
+ */
+function trimArchive_(ss, newStart) {
+  const sh = ss.getSheetByName(SHEET_ARCHIVE);
+  if (!sh || sh.getLastRow() < 2) return;
+  const tz = ss.getSpreadsheetTimeZone();
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, 3).getValues();
+  const labels = {};
+  data.forEach((r, i) => {
+    if (!isDate_(r[1]) || !isDate_(r[2]) || ymd_(r[2], tz) < newStart) return;
+    (labels[r[0]] = labels[r[0]] || { from: ymd_(r[1], tz), rows: [] }).rows.push(i + 2);
+  });
+  Object.keys(labels).forEach((label) => {
+    const b = labels[label];
+    b.rows.sort((x, y) => y - x).forEach((row) => sh.deleteRow(row));
+    if (b.from < newStart) archiveRange_(ss, b.from, addDays_(newStart, -1));
+  });
 }
 
 // ---------- Календарь план ----------
@@ -1161,19 +1216,23 @@ function rebuildPlanCalendar() {
     const refRows = ss.getSheetByName(SHEET_REF).getRange(2, 1, 200, 7).getValues().filter((r) => r[0]);
     const cats = refRows.filter((r) => r[1] === 'Доход').concat(refRows.filter((r) => r[1] !== 'Доход'))
       .map((r) => {
-        const rel = r[1] === 'Доход' ? (r[6] || EXPECTED) : '';
-        // Сдвиг периода — как на «Своде»: гарантированные доходы и обязательные статьи
+        // Колонка «Пометка»: у доходов — надёжность (правится), у расходов — «ежедневная», если так в справочнике
+        const rel = r[1] === 'Доход' ? (r[6] || EXPECTED) : (r[4] === 'да' ? DAILY_MARK : '');
+        // Окно зарплаты — как на «Своде»: у гарантированных доходов и обязательных статей последние дни периода
+        // уже относятся к следующему
         const shift = (r[1] === 'Доход' ? rel === GUARANTEED : r[2] === 'да') ? NEXT_INCOME_DAYS : 0;
         return { name: String(r[0]), type: r[1] || 'Расход', rel: rel, shift: shift };
       });
 
-    // Планы по дням
+    // Планы и факты по дням (факты — для ежедневных статей, они сверяются день за днём)
     const plan = {};
+    const fact = {};
     readTx_(ss).forEach((x) => {
       const t = txObj_(x.v, tz);
-      if (t.status !== 'План' || t.type === TRANSFER) return;
-      const k = t.category.toLowerCase() + '|' + t.type + '|' + t.date;
-      plan[k] = (plan[k] || 0) + t.amount;
+      if (t.type === TRANSFER) return;
+      const k = String(t.category).toLowerCase() + '|' + t.type + '|' + t.date;
+      if (t.status === 'План') plan[k] = (plan[k] || 0) + t.amount;
+      else if (t.status === 'Факт') fact[k] = (fact[k] || 0) + t.amount;
     });
 
     let sh = ss.getSheetByName(SHEET_PLAN_CAL);
@@ -1193,12 +1252,13 @@ function rebuildPlanCalendar() {
 
     sh.getRange(1, 1).setValue('Календарь план').setFontWeight('bold').setFontSize(14);
     sh.getRange(2, 1).setValue('Впиши плановые суммы в ячейки дней — они сразу попадут в план. ' +
-      'Серые зачёркнутые — уже покрыты фактом, оранжевые — покрыты частично. ' +
+      'Серые зачёркнутые — уже покрыты фактом, оранжевые — покрыты частично; ' +
+      'ежедневные статьи сверяются день за днём: красный день — потратил больше плана. ' +
       '«Осталось» красным — по статье потрачено больше плана, заложи ещё. ' +
       '«Надёжность» у доходов: «Гарантировано» входит в прогноз, «Ожидается» — нет.').setFontStyle('italic').setFontColor('#777777');
 
     // Шапка
-    const head = ['Категория', 'Тип', 'План', 'Потрачено', 'Осталось', 'Надёжность'].concat(days.map((d) => parseYmd_(d)));
+    const head = ['Категория', 'Тип', 'План', 'Потрачено', 'Осталось', 'Пометка'].concat(days.map((d) => parseYmd_(d)));
     sh.getRange(PC_HEAD, 1, 1, head.length).setValues([head])
       .setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#37474F').setHorizontalAlignment('center');
     sh.getRange(PC_HEAD, PC_DAY_COL, 1, days.length).setNumberFormat('dd.mm');
@@ -1226,7 +1286,7 @@ function rebuildPlanCalendar() {
       return [c.name, c.type,
         `=SUM(${firstDay}${r}:${lastCol}${r})`,
         `=SUMIFS(${T}!$E:$E,${T}!$F:$F,$A${r},${T}!$D:$D,$B${r},${T}!$C:$C,"Факт",` +
-        `${T}!$B:$B,">="&($${firstDay}$${PC_HEAD}-${c.shift}),${T}!$B:$B,"<="&($${lastCol}$${PC_HEAD}-${c.shift}))`,
+        `${T}!$B:$B,">="&$${firstDay}$${PC_HEAD},${T}!$B:$B,"<="&($${lastCol}$${PC_HEAD}-${c.shift}))`,
         `=C${r}-D${r}`, c.rel]
         .concat(days.map((d) => plan[c.name.toLowerCase() + '|' + c.type + '|' + d] || ''));
     });
@@ -1241,7 +1301,35 @@ function rebuildPlanCalendar() {
         if (c.type === 'Доход') sh.getRange(PC_FIRST + i, PC_REL_COL).setDataValidation(relRule).setBackground('#FFF8E1');
       });
       sh.getRange(PC_FIRST, PC_DAY_COL, n, days.length).setValues(rows.map((r) => r.slice(6)));
-      sh.getRange(PC_FIRST, PC_DAY_COL, n, days.length).setBackground('#E3F2FD');
+      // Фон и зачёркивание. Ежедневные статьи — день за днём: прошедший день в плане — серый,
+      // с перерасходом — красный; сегодня — оранжевый, если уже тратили; будущие дни не трогаем.
+      const today = ymd_(new Date(), tz);
+      const bg = [];
+      const line = [];
+      cats.forEach((c) => {
+        const b = [];
+        const l = [];
+        days.forEach((d) => {
+          let color = '#E3F2FD';
+          let strike = 'none';
+          if (c.rel === DAILY_MARK && d <= today) {
+            const k = c.name.toLowerCase() + '|' + c.type + '|' + d;
+            const p = plan[k] || 0;
+            const f = fact[k] || 0;
+            if (f > p) color = '#FFCDD2';
+            else if (d < today && p > 0) { color = '#E0E0E0'; strike = 'line-through'; }
+            else if (d === today && f > 0) color = '#FFE0B2';
+          }
+          b.push(color);
+          l.push(strike);
+        });
+        bg.push(b);
+        line.push(l);
+      });
+      sh.getRange(PC_FIRST, PC_DAY_COL, n, days.length).setBackgrounds(bg).setFontLines(line);
+      cats.forEach((c, i) => {
+        if (c.rel === DAILY_MARK) sh.getRange(PC_FIRST + i, PC_REL_COL).setFontColor('#777777');
+      });
     }
     sh.getRange(PC_HEAD + 1, 3, n + 2, head.length - 2).setNumberFormat('#,##0;-#,##0;""');
 
@@ -1251,10 +1339,10 @@ function rebuildPlanCalendar() {
     const cum = `SUM($${firstDay}${PC_FIRST}:${f})`;
     const rules = [
       SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied(F(`=AND(${f}<>"",${cum}<=$D${PC_FIRST})`))
+        .whenFormulaSatisfied(F(`=AND(${f}<>"",$F${PC_FIRST}<>"${DAILY_MARK}",${cum}<=$D${PC_FIRST})`))
         .setBackground('#E0E0E0').setFontColor('#9E9E9E').setStrikethrough(true).setRanges([grid]).build(),
       SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied(F(`=AND(${f}<>"",${cum}-${f}<$D${PC_FIRST},${cum}>$D${PC_FIRST})`))
+        .whenFormulaSatisfied(F(`=AND(${f}<>"",$F${PC_FIRST}<>"${DAILY_MARK}",${cum}-${f}<$D${PC_FIRST},${cum}>$D${PC_FIRST})`))
         .setBackground('#FFE0B2').setRanges([grid]).build(),
       SpreadsheetApp.newConditionalFormatRule()
         .whenFormulaSatisfied(F(`=AND($B${PC_FIRST}="Расход",$E${PC_FIRST}<0)`))
