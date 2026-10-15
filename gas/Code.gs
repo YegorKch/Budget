@@ -5,7 +5,8 @@
  * Все расчёты — на листе «Свод». Скрипт только читает готовые значения по ключам
  * из колонки C «Свода» и отбирает строки для списков.
  *
- * GET               → { ok, summary, top, categories, accounts, balances, balanceHistory, who, expected, recent, feed, serverTime }
+ * GET               → { ok, summary, top, categories, categoryTable, accounts, balances, balanceHistory, who,
+ *                       expected, recent, feed, serverTime }
  * POST (text/plain) → { action: 'add' | 'update' | 'delete' | 'setBalance', ... } → то же, что GET, плюс result
  */
 
@@ -14,6 +15,14 @@ const SHEET_SUMMARY = 'Свод';
 const SHEET_REF = 'Справочники';
 const SHEET_ACCOUNTS = 'Счета';
 const SHEET_HISTORY = 'История счетов';
+const SHEET_PLAN_CAL = 'Календарь план';
+const SHEET_ARCHIVE = 'Архив';
+// Период бюджета: с этого числа месяца по число перед ним в следующем месяце (10.10–09.11).
+const PERIOD_START_DAY = 10;
+// «Календарь план»: строка с датами, первая строка категорий, первая колонка дней (F)
+const PC_HEAD = 4;
+const PC_FIRST = 7;
+const PC_DAY_COL = 6;
 const HISTORY_DAYS = 60;      // сколько хранить историю сверок счетов
 
 const TX_COLS = ['ID', 'Дата', 'Статус', 'Тип', 'Сумма', 'Категория', 'Счёт', 'Кто', 'Комментарий', 'Создано', 'На счёт'];
@@ -24,11 +33,17 @@ const RECENT_COUNT = 20;
 const STATUSES = ['План', 'Факт'];
 const TYPES = ['Расход', 'Доход', 'Перевод'];
 const TRANSFER = 'Перевод';   // тип и категория перевода между счетами: не трата и не доход
+// Обязательные статьи (пометка «да» в «Справочниках», колонка C) — для прогноза «хватит ли до зарплаты»
+const MANDATORY_DEFAULT = ['Рассрочки', 'Арина рассрочки', 'Каспи рэд (кредитка)', 'Арина учеба', 'Ком услуги',
+  'Домашний интернет', 'Сбережения', 'Арина англ', 'Тренер Арине', 'Подписки/Тарифы'];
 
 // ---------- HTTP ----------
 
 function doGet() {
-  return respond_(() => snapshot_());
+  return respond_(() => {
+    ensurePeriodLocked_();
+    return snapshot_();
+  });
 }
 
 function doPost(e) {
@@ -73,6 +88,7 @@ function snapshot_() {
     summary: sv.values,
     top: sv.top,
     categories: ref.categories,
+    categoryTable: sv.table,
     accounts: ref.accounts,
     balances: readBalances_(ss),
     balanceHistory: readBalanceHistory_(ss, tz),
@@ -84,13 +100,17 @@ function snapshot_() {
   };
 }
 
-/** Ключ → значение из колонки C/B «Свода» и таблица по категориям. */
+/**
+ * Ключ → значение из колонки C/B «Свода» и таблица по категориям
+ * (A категория, B тип, C план, D факт, H осталось по плану, M обязательная).
+ */
 function readSummary_(ss, tz) {
   const sh = ss.getSheetByName(SHEET_SUMMARY);
-  const data = sh.getRange(1, 1, sh.getLastRow(), 8).getValues();
+  const data = sh.getRange(1, 1, sh.getLastRow(), Math.min(13, sh.getMaxColumns())).getValues();
   const values = {};
   const topRaw = [];
   const byCategory = {};
+  const table = [];
   let tableStart = -1;
 
   data.forEach((row, i) => {
@@ -105,13 +125,17 @@ function readSummary_(ss, tz) {
     for (let i = tableStart; i < data.length; i++) {
       const [cat, type, plan, fact] = data[i];
       if (!cat) continue;
-      byCategory[cat] = { type: type, plan: num_(plan), fact: num_(fact) };
+      // Одно имя может быть и доходом, и расходом («Прочие») — ключ с типом.
+      byCategory[cat + '|' + type] = { type: type, plan: num_(plan), fact: num_(fact) };
+      table.push({ name: String(cat), type: type, plan: num_(plan), fact: num_(fact),
+        left: num_(data[i][7]), mandatory: data[i][12] === 'да' });
     }
   }
   return {
     values: values,
     top: topRaw.filter((t) => t.category).map((t) => ({ category: t.category, count: num_(t.count) })),
     byCategory: byCategory,
+    table: table,
   };
 }
 
@@ -238,12 +262,13 @@ function expected_(rows, sv, tz) {
     .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 
   const factLeft = {};
-  Object.keys(sv.byCategory).forEach((c) => { factLeft[c] = sv.byCategory[c].fact; });
+  Object.keys(sv.byCategory).forEach((k) => { factLeft[k] = sv.byCategory[k].fact; });
 
   const out = [];
   plans.forEach((p) => {
-    const covered = Math.min(p.amount, factLeft[p.category] || 0);
-    factLeft[p.category] = (factLeft[p.category] || 0) - covered;
+    const key = p.category + '|' + p.type;
+    const covered = Math.min(p.amount, factLeft[key] || 0);
+    factLeft[key] = (factLeft[key] || 0) - covered;
     const left = p.amount - covered;
     if (left > 0 && p.date <= to) {
       out.push(Object.assign(p, { left: left, overdue: p.date < today }));
@@ -375,21 +400,26 @@ function validate_(tx, isNew) {
   }
   if (!t.category) throw new Error('Не указана категория');
   t.comment = String(t.comment || '').trim();
+  if (/^[=+\-@]/.test(t.comment)) t.comment = "'" + t.comment;
   return t;
 }
 
-/** Новая категория из приложения дописывается в первую пустую строку справочника. */
+/**
+ * Новая категория из приложения дописывается в первую пустую строку справочника.
+ * Категория — это пара «имя + тип»: «Прочие» может быть и доходом, и расходом.
+ * Имя сравнивается без учёта регистра — так же, как его сравнивают формулы таблицы.
+ */
 function ensureCategory_(ss, name, type) {
   const sh = ss.getSheetByName(SHEET_REF);
   const last = Math.max(sh.getLastRow(), 1);
-  const col = sh.getRange(1, 1, last + 1, 1).getValues();
+  const rows = sh.getRange(1, 1, last + 1, 2).getValues();
   let empty = -1;
-  for (let i = 1; i < col.length; i++) {
-    const v = String(col[i][0]).trim();
-    if (v.toLowerCase() === name.toLowerCase()) return;
+  for (let i = 1; i < rows.length; i++) {
+    const v = String(rows[i][0]).trim();
+    if (v.toLowerCase() === name.toLowerCase() && (rows[i][1] || 'Расход') === type) return;
     if (!v && empty < 0) empty = i + 1;
   }
-  if (empty < 0) empty = col.length + 1;
+  if (empty < 0) empty = rows.length + 1;
   sh.getRange(empty, 1, 1, 2).setValues([[name, type]]);
 }
 
@@ -633,8 +663,13 @@ function fixFormulas() {
  */
 function withEnglishLocale_(fn) {
   const ss = SpreadsheetApp.getActive();
-  const locale = ss.getSpreadsheetLocale();
-  if (locale !== 'en_US') ss.setSpreadsheetLocale('en_US');
+  // Исходную локаль запоминаем: если прошлый запуск оборвался по времени, таблица осталась в en_US,
+  // и вернуть надо ту, что была до него.
+  const props = PropertiesService.getScriptProperties();
+  let locale = ss.getSpreadsheetLocale();
+  if (locale === 'en_US' && props.getProperty('origLocale')) locale = props.getProperty('origLocale');
+  else props.setProperty('origLocale', locale);
+  if (ss.getSpreadsheetLocale() !== 'en_US') ss.setSpreadsheetLocale('en_US');
   try {
     return fn();
   } finally {
@@ -701,6 +736,475 @@ function writeSummaryFormulas_(sv) {
   setF('startBalance', 'Остаток на начало периода (считается из счетов)',
     `=${cell('balanceNow')}-SUMIF(${col('B')},"Доход",${col('D')})+SUMIF(${col('B')},"Расход",${col('D')})`,
     'Нужен «Календарю»: на счетах сейчас минус операции периода');
+}
+
+/**
+ * v3 → v4: прогноз до зарплаты и исправления по итогам анализа. Запустить один раз; повторно — безопасно.
+ * 1. «Справочники»: колонка C «Обязательная» («да» у рассрочек, учёбы, коммуналки и т.п.).
+ * 2. «Справочники»: дописываются пары «категория + тип», которые есть в транзакциях, но нет в справочнике
+ *    (например «Прочие» как доход) — иначе такие суммы попадали не в ту строку «Свода».
+ * 3. «Транзакции»: комментарии, превратившиеся в формулу (#NAME?), возвращаются текстом.
+ * 4. «Свод»: таблица по категориям считает с учётом типа (доход/расход); новые колонки
+ *    L «Факт за 7 дней» и M «Обязательная»; блок прогноза до зарплаты.
+ */
+function migrateV4() {
+  withEnglishLocale_(() => {
+    const ss = SpreadsheetApp.getActive();
+    const ref = ss.getSheetByName(SHEET_REF);
+    const tx = ss.getSheetByName(SHEET_TX);
+    const sv = ss.getSheetByName(SHEET_SUMMARY);
+    const log = [];
+
+    // 1. Обязательные статьи
+    if (ref.getRange('C1').getValue() !== 'Обязательная') {
+      ref.getRange('C1').setValue('Обязательная');
+      ref.getRange('A1').copyFormatToRange(ref, 3, 3, 1, 1);
+      const n = Math.max(ref.getLastRow() - 1, 1);
+      const names = ref.getRange(2, 1, n, 2).getValues();
+      ref.getRange(2, 3, n, 1).setValues(names.map((r) =>
+        [r[1] === 'Расход' && MANDATORY_DEFAULT.indexOf(String(r[0])) >= 0 ? 'да' : '']));
+      ref.getRange(2, 3, Math.min(ref.getMaxRows() - 1, 499), 1).setDataValidation(
+        SpreadsheetApp.newDataValidation().requireValueInList(['да'], true).setAllowInvalid(true).build());
+      ref.setColumnWidth(3, 110);
+      log.push('Справочники: колонка «Обязательная»');
+    }
+
+    // 2. Недостающие пары «категория + тип» из транзакций — справочник читаем один раз, дописываем пачкой
+    const last = tx.getLastRow();
+    const txv = last > 1 ? tx.getRange(2, 1, last - 1, COL['Комментарий']).getValues() : [];
+    const refN = Math.max(ref.getLastRow() - 1, 1);
+    const known = new Set(ref.getRange(2, 1, refN, 2).getValues()
+      .filter((r) => r[0]).map((r) => String(r[0]).trim().toLowerCase() + '|' + (r[1] || 'Расход')));
+    const added = [];
+    txv.forEach((r) => {
+      const type = r[COL['Тип'] - 1];
+      const cat = String(r[COL['Категория'] - 1] || '').trim();
+      if (!cat || type === TRANSFER || TYPES.indexOf(type) < 0) return;
+      const k = cat.toLowerCase() + '|' + type;
+      if (known.has(k)) return;
+      known.add(k);
+      added.push([cat, type]);
+    });
+    if (added.length) {
+      // Первая пустая строка в колонке A (в C/D/F справочника могут быть другие данные)
+      const colA = ref.getRange(1, 1, ref.getMaxRows(), 1).getValues();
+      let r0 = colA.length;
+      while (r0 > 1 && !colA[r0 - 1][0]) r0--;
+      ref.getRange(r0 + 1, 1, added.length, 2).setValues(added);
+      log.push('Справочники: добавлены ' + added.map((a) => a[0] + ' (' + a[1] + ')').join(', '));
+    }
+
+    // 3. Сломанные комментарии
+    if (last > 1) {
+      const rng = tx.getRange(2, COL['Комментарий'], last - 1, 1);
+      const f = rng.getFormulas();
+      let fixed = 0;
+      f.forEach((r, i) => {
+        if (r[0]) { tx.getRange(i + 2, COL['Комментарий']).setValue("'" + r[0]); fixed++; }
+      });
+      if (fixed) log.push('Транзакции: восстановлено комментариев — ' + fixed);
+    }
+
+    // 4. Период с 10-го по 9-е; прошедшее — в «Архив»
+    const pr = summaryKeyRow_(sv, 'periodEnd');
+    sv.getRange(pr, 1).setValue(`Конец периода (период с ${PERIOD_START_DAY}-го, сдвигается сам)`);
+    sv.getRange(summaryKeyRow_(sv, 'periodStart'), 1).setValue('Начало периода (сдвигается сам)');
+    if (ensurePeriod_(ss)) log.push('Период переставлен, прошедшее записано в «Архив»');
+
+    // 5. Свод
+    writeCategoryTableFormulas_(sv);
+    log.push('Свод: категории считаются с учётом типа, добавлены «Факт за 7 дней» и «Обязательная»');
+    if (!summaryKeyRow_(sv, 'lifeMoney')) {
+      sv.insertRowsAfter(summaryKeyRow_(sv, 'savingsForecast'), 8);
+      log.push('Свод: добавлен блок прогноза до зарплаты');
+    }
+    writeForecastFormulas_(sv);
+    SpreadsheetApp.flush();
+
+    Logger.log(log.join('; '));
+  });
+}
+
+/** Таблица по категориям на «Своде»: суммы с учётом типа + факт за 7 дней + пометка «обязательная». */
+function writeCategoryTableFormulas_(sv) {
+  const T = "'Транзакции'";
+  const data = sv.getRange(1, 1, sv.getLastRow(), 2).getValues();
+  const head = data.findIndex((r) => r[0] === 'Категория' && r[1] === 'Тип') + 1;
+  if (head < 1) throw new Error('На «Своде» не найдена таблица по категориям');
+  const ps = `$B$${summaryKeyRow_(sv, 'periodStart')}`;
+  const pe = `$B$${summaryKeyRow_(sv, 'periodEnd')}`;
+  sv.getRange(head, 12, 1, 2).setValues([['Факт за 7 дней', 'Обязательная']])
+    .setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#37474F').setWrap(true);
+  const cde = [];
+  const j = [];
+  const lm = [];
+  for (let k = 0; k < 100; k++) {
+    const r = head + 1 + k;
+    const i = k + 2;   // строка «Справочников»
+    const a = `$A${r}`;
+    const base = `${T}!$E:$E,${T}!$F:$F,${a},${T}!$D:$D,$B${r}`;
+    const period = `${T}!$B:$B,">="&${ps},${T}!$B:$B,"<="&${pe}`;
+    const blank = `IF(${a}="","",`;
+    cde.push([
+      `=${blank}SUMIFS(${base},${T}!$C:$C,"План",${period}))`,
+      `=${blank}SUMIFS(${base},${T}!$C:$C,"Факт",${period}))`,
+      `=${blank}SUMIFS(${base},${T}!$C:$C,"Факт",${period},${T}!$B:$B,"<"&TODAY()))`,
+    ]);
+    j.push([`=${blank}COUNTIFS(${T}!$F:$F,${a},${T}!$D:$D,$B${r},${T}!$C:$C,"Факт",` +
+      `${T}!$B:$B,">="&(TODAY()-30),${T}!$B:$B,"<="&TODAY()))`]);
+    lm.push([
+      `=${blank}SUMIFS(${base},${T}!$C:$C,"Факт",${T}!$B:$B,">="&(TODAY()-7),${T}!$B:$B,"<"&TODAY()))`,
+      `=${blank}IF('Справочники'!C${i}="да","да",""))`,
+    ]);
+  }
+  sv.getRange(head + 1, 3, 100, 3).setFormulas(cde);
+  sv.getRange(head + 1, 10, 100, 1).setFormulas(j);
+  sv.getRange(head + 1, 12, 100, 2).setFormulas(lm);
+  sv.getRange(head + 1, 12, 100, 1).setNumberFormat('#,##0;-#,##0;""');
+  sv.setColumnWidth(12, 100);
+  sv.setColumnWidth(13, 100);
+}
+
+/**
+ * Блок прогноза под «Накоплениями»: деньги на жизнь до зарплаты, можно в день, темп, когда закончатся.
+ * «На жизнь» = на счетах + ещё ожидаемые доходы − ещё не оплаченные обязательные статьи.
+ * Темп — средние траты за 7 полных дней по всем необязательным статьям.
+ */
+function writeForecastFormulas_(sv) {
+  const data = sv.getRange(1, 1, sv.getLastRow(), 2).getValues();
+  const head = data.findIndex((r) => r[0] === 'Категория' && r[1] === 'Тип') + 1;
+  const first = head + 1;
+  const lastRow = first + 99;
+  const col = (c) => `$${c}$${first}:$${c}$${lastRow}`;
+  const cell = (key) => `$B$${summaryKeyRow_(sv, key)}`;
+  const start = summaryKeyRow_(sv, 'savingsForecast') + 1;
+  const rows = [
+    ['', '', '', ''],
+    ['Прогноз до конца периода', '', '', ''],
+    ['Начало следующего периода', `=${cell('periodEnd')}+1`, 'payday', 'День после конца периода'],
+    ['Деньги на жизнь до конца периода', '', 'lifeMoney', 'На счетах + ожидаемые доходы − ещё не оплаченные обязательные статьи'],
+    ['Можно тратить в день', '', 'dailyBudget', 'Деньги на жизнь / дней осталось'],
+    ['Темп трат за 7 дней, ₸/день', '', 'pace7', 'Все необязательные статьи, 7 полных дней до сегодня'],
+    ['При таком темпе деньги закончатся', '', 'runOutDate', 'Пусто — темп нулевой'],
+    ['Прогноз к концу периода: запас (+) / нехватка (−)', '', 'forecastGap', 'Деньги на жизнь − темп × дней осталось'],
+  ];
+  sv.getRange(start, 1, rows.length, 4).setValues(rows.map((r) => [r[0], r[1] && !r[1].startsWith('=') ? r[1] : '', r[2], r[3]]));
+  sv.getRange(start + 1, 1).setFontWeight('bold').setFontSize(12);
+  const set = (key, f, fmt) => {
+    const r = summaryKeyRow_(sv, key);
+    sv.getRange(r, 2).setFormula(f).setNumberFormat(fmt);
+    sv.getRange(r, 3).setBackground('#FFF8E1');
+    sv.getRange(r, 4).setFontStyle('italic').setFontColor('#777777');
+  };
+  set('payday', `=${cell('periodEnd')}+1`, 'dd.mm.yyyy');
+  set('lifeMoney', `=ROUND(${cell('balanceNow')}+SUMIF(${col('B')},"Доход",${col('H')})` +
+    `-SUMIFS(${col('H')},${col('B')},"Расход",${col('M')},"да"),0)`, '#,##0');
+  set('dailyBudget', `=ROUND(${cell('lifeMoney')}/${cell('daysLeft')},0)`, '#,##0');
+  set('pace7', `=ROUND(SUMIFS(${col('L')},${col('B')},"Расход",${col('M')},"<>да")/7,0)`, '#,##0');
+  set('runOutDate', `=IF(${cell('pace7')}<=0,"",IF(${cell('lifeMoney')}<=0,TODAY(),` +
+    `TODAY()+INT(${cell('lifeMoney')}/${cell('pace7')})))`, 'dd.mm.yyyy');
+  set('forecastGap', `=ROUND(${cell('lifeMoney')}-${cell('pace7')}*${cell('daysLeft')},0)`, '#,##0;-#,##0');
+}
+
+// ---------- Период и архив ----------
+
+/** Период, в который попадает сегодняшний день: с PERIOD_START_DAY-го по день перед ним в следующем месяце. */
+function currentPeriod_(tz) {
+  const [y, m, d] = ymd_(new Date(), tz).split('-').map(Number);
+  const sm = d >= PERIOD_START_DAY ? m : m - 1;           // месяц начала (может быть 0 = декабрь прошлого года)
+  const start = new Date(Date.UTC(y, sm - 1, PERIOD_START_DAY));
+  const next = new Date(Date.UTC(y, sm, PERIOD_START_DAY));
+  return { start: start.toISOString().slice(0, 10), end: new Date(next - 864e5).toISOString().slice(0, 10) };
+}
+
+/**
+ * Если сегодня уже вне периода «Свода» — записать прошедшее в «Архив» и переставить период.
+ * Возвращает true, если период менялся. Транзакции не трогает.
+ */
+function ensurePeriod_(ss) {
+  const tz = ss.getSpreadsheetTimeZone();
+  const sv = ss.getSheetByName(SHEET_SUMMARY);
+  const rs = summaryKeyRow_(sv, 'periodStart');
+  const re = summaryKeyRow_(sv, 'periodEnd');
+  const oldStart = sv.getRange(rs, 2).getValue();
+  const oldEnd = sv.getRange(re, 2).getValue();
+  const cur = currentPeriod_(tz);
+  if (isDate_(oldStart) && isDate_(oldEnd) && ymd_(oldStart, tz) === cur.start && ymd_(oldEnd, tz) === cur.end) return false;
+
+  if (isDate_(oldStart) && ymd_(oldStart, tz) < cur.start) archiveRange_(ss, ymd_(oldStart, tz), addDays_(cur.start, -1));
+  sv.getRange(rs, 2).setValue(parseYmd_(cur.start));
+  sv.getRange(re, 2).setValue(parseYmd_(cur.end));
+  SpreadsheetApp.flush();
+  try { rebuildPlanCalendar(); } catch (err) { /* сетку можно перестроить из меню */ }
+  return true;
+}
+
+/** То же для веб-приложения: под блокировкой, чтобы два телефона не сдвинули период дважды. */
+function ensurePeriodLocked_() {
+  const ss = SpreadsheetApp.getActive();
+  const tz = ss.getSpreadsheetTimeZone();
+  const sv = ss.getSheetByName(SHEET_SUMMARY);
+  const end = sv.getRange(summaryKeyRow_(sv, 'periodEnd'), 2).getValue();
+  if (isDate_(end) && ymd_(new Date(), tz) <= ymd_(end, tz)) return;   // быстрый путь — период актуален
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { ensurePeriod_(ss); } finally { lock.releaseLock(); }
+}
+
+/**
+ * Итоги диапазона дат в «Архив»: по каждой статье план, факт, отклонение и итоговые строки.
+ * Суммы считаются из «Транзакций» и записываются числами — архив не меняется задним числом.
+ * Повторно тот же диапазон не пишется.
+ */
+function archiveRange_(ss, from, to) {
+  const tz = ss.getSpreadsheetTimeZone();
+  let sh = ss.getSheetByName(SHEET_ARCHIVE);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_ARCHIVE, ss.getSheets().length);
+    sh.getRange(1, 1, 1, 8).setValues([['Период', 'С', 'По', 'Статья', 'Тип', 'План', 'Факт', 'Факт − План']])
+      .setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#37474F');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 120);
+    sh.setColumnWidth(4, 190);
+  }
+  const label = `${from.slice(8, 10)}.${from.slice(5, 7)}.${from.slice(0, 4)}–${to.slice(8, 10)}.${to.slice(5, 7)}.${to.slice(0, 4)}`;
+  if (sh.getLastRow() > 1 && sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().some((r) => r[0] === label)) return;
+
+  const agg = {};
+  readTx_(ss).forEach((x) => {
+    const t = txObj_(x.v, tz);
+    if (t.type === TRANSFER || t.date < from || t.date > to) return;
+    const k = String(t.category) + '|' + t.type;
+    agg[k] = agg[k] || { name: String(t.category), type: t.type, plan: 0, fact: 0 };
+    if (t.status === 'План') agg[k].plan += t.amount;
+    else if (t.status === 'Факт') agg[k].fact += t.amount;
+  });
+  const items = Object.values(agg).sort((a, b) => (a.type === b.type ? b.fact - a.fact : a.type === 'Доход' ? -1 : 1));
+  const f = parseYmd_(from);
+  const t2 = parseYmd_(to);
+  const rows = items.map((i) => [label, f, t2, i.name, i.type, i.plan, i.fact, i.fact - i.plan]);
+  ['Доход', 'Расход'].forEach((type) => {
+    const list = items.filter((i) => i.type === type);
+    const pl = list.reduce((a, i) => a + i.plan, 0);
+    const fa = list.reduce((a, i) => a + i.fact, 0);
+    rows.push([label, f, t2, type === 'Доход' ? 'ИТОГО доходы' : 'ИТОГО расходы', type, pl, fa, fa - pl]);
+  });
+  const r0 = sh.getLastRow() + 1;
+  sh.getRange(r0, 1, rows.length, 8).setValues(rows);
+  sh.getRange(r0, 2, rows.length, 2).setNumberFormat('dd.mm.yyyy');
+  sh.getRange(r0, 6, rows.length, 3).setNumberFormat('#,##0;-#,##0;0');
+  sh.getRange(r0 + rows.length - 2, 1, 2, 8).setFontWeight('bold').setBackground('#ECEFF1');
+}
+
+// ---------- Календарь план ----------
+//
+// Редактируемая сетка «категория × день». Источник правды — плановые строки в «Транзакциях»:
+// сетка из них строится (rebuildPlanCalendar), а правка ячейки сразу переписывает план этого дня
+// (onEdit → syncPlanCells_). Поэтому приложение, «Свод» и прогноз видят изменения без доработок.
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Бюджет')
+    .addItem('Обновить Календарь план', 'rebuildPlanCalendar')
+    .addToUi();
+  try { ensurePeriod_(SpreadsheetApp.getActive()); } catch (err) { /* не мешаем открыть таблицу */ }
+  try { rebuildPlanCalendar(); } catch (err) { /* не мешаем открыть таблицу */ }
+}
+
+function onEdit(e) {
+  if (!e || !e.range) return;
+  const sh = e.range.getSheet();
+  if (sh.getName() !== SHEET_PLAN_CAL) return;
+  if (e.range.getLastRow() < PC_FIRST || e.range.getLastColumn() < PC_DAY_COL) return;
+  syncPlanCells_(sh, e.range);
+}
+
+/** Перестраивает «Календарь план» из плановых строк «Транзакций» на текущий период «Свода». */
+function rebuildPlanCalendar() {
+  {
+    const ss = SpreadsheetApp.getActive();
+    const tz = ss.getSpreadsheetTimeZone();
+    const sv = ss.getSheetByName(SHEET_SUMMARY);
+    const ps = sv.getRange(summaryKeyRow_(sv, 'periodStart'), 2).getValue();
+    const pe = sv.getRange(summaryKeyRow_(sv, 'periodEnd'), 2).getValue();
+    if (!isDate_(ps) || !isDate_(pe)) throw new Error('На «Своде» не заданы начало и конец периода');
+    const days = [];
+    for (let d = ymd_(ps, tz); d <= ymd_(pe, tz); d = addDays_(d, 1)) days.push(d);
+
+    // Категории: сначала доходы, потом расходы — в порядке справочника
+    const refRows = ss.getSheetByName(SHEET_REF).getRange(2, 1, 200, 2).getValues().filter((r) => r[0]);
+    const cats = refRows.filter((r) => r[1] === 'Доход').concat(refRows.filter((r) => r[1] !== 'Доход'))
+      .map((r) => ({ name: String(r[0]), type: r[1] || 'Расход' }));
+
+    // Планы по дням
+    const plan = {};
+    readTx_(ss).forEach((x) => {
+      const t = txObj_(x.v, tz);
+      if (t.status !== 'План' || t.type === TRANSFER) return;
+      const k = t.category.toLowerCase() + '|' + t.type + '|' + t.date;
+      plan[k] = (plan[k] || 0) + t.amount;
+    });
+
+    let sh = ss.getSheetByName(SHEET_PLAN_CAL);
+    if (!sh) sh = ss.insertSheet(SHEET_PLAN_CAL, ss.getSheets().length);
+    const width = PC_DAY_COL - 1 + days.length;
+    if (sh.getMaxColumns() < width) sh.insertColumnsAfter(sh.getMaxColumns(), width - sh.getMaxColumns());
+    const height = PC_FIRST - 1 + cats.length;
+    if (sh.getMaxRows() < height + 5) sh.insertRowsAfter(sh.getMaxRows(), height + 5 - sh.getMaxRows());
+    sh.clear();
+    sh.clearConditionalFormatRules();
+    const F = formulaDialect_(sh);
+
+    const lastCol = colLetter_(width);
+    const firstDay = colLetter_(PC_DAY_COL);
+    const n = cats.length;
+    const lastRow = PC_FIRST + n - 1;
+
+    sh.getRange(1, 1).setValue('Календарь план').setFontWeight('bold').setFontSize(14);
+    sh.getRange(2, 1).setValue('Впиши плановые суммы в ячейки дней — они сразу попадут в план. ' +
+      'Серые зачёркнутые — уже покрыты фактом, оранжевые — покрыты частично. ' +
+      '«Осталось» красным — по статье потрачено больше плана, заложи ещё.').setFontStyle('italic').setFontColor('#777777');
+
+    // Шапка
+    const head = ['Категория', 'Тип', 'План', 'Потрачено', 'Осталось'].concat(days.map((d) => parseYmd_(d)));
+    sh.getRange(PC_HEAD, 1, 1, head.length).setValues([head])
+      .setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#37474F').setHorizontalAlignment('center');
+    sh.getRange(PC_HEAD, PC_DAY_COL, 1, days.length).setNumberFormat('dd.mm');
+    const wd = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
+    sh.getRange(PC_HEAD - 1, PC_DAY_COL, 1, days.length)
+      .setValues([days.map((d) => wd[parseYmd_(d).getDay()])]).setFontColor('#777777').setHorizontalAlignment('center');
+
+    // Итоги по дням
+    const tot = [['Итого доходы', 'Доход'], ['Итого расходы', 'Расход']].map(([label, type]) =>
+      [label, '', `=SUMIF($B$${PC_FIRST}:$B$${lastRow},"${type}",C${PC_FIRST}:C${lastRow})`,
+        `=SUMIF($B$${PC_FIRST}:$B$${lastRow},"${type}",D${PC_FIRST}:D${lastRow})`,
+        `=SUMIF($B$${PC_FIRST}:$B$${lastRow},"${type}",E${PC_FIRST}:E${lastRow})`]
+        .concat(days.map((_, i) => {
+          const c = colLetter_(PC_DAY_COL + i);
+          return `=SUMIF($B$${PC_FIRST}:$B$${lastRow},"${type}",${c}${PC_FIRST}:${c}${lastRow})`;
+        })));
+    sh.getRange(PC_HEAD + 1, 1, 2, head.length).setFormulas(tot.map((r) => r.map((v) => (String(v).startsWith('=') ? F(v) : ''))));
+    sh.getRange(PC_HEAD + 1, 1, 2, 1).setValues([['Итого доходы'], ['Итого расходы']]);
+    sh.getRange(PC_HEAD + 1, 1, 2, head.length).setFontWeight('bold').setBackground('#ECEFF1');
+
+    // Категории: имя, тип, формулы, планы по дням
+    const T = "'Транзакции'";
+    const rows = cats.map((c, i) => {
+      const r = PC_FIRST + i;
+      return [c.name, c.type,
+        `=SUM(${firstDay}${r}:${lastCol}${r})`,
+        `=SUMIFS(${T}!$E:$E,${T}!$F:$F,$A${r},${T}!$D:$D,$B${r},${T}!$C:$C,"Факт",` +
+        `${T}!$B:$B,">="&$${firstDay}$${PC_HEAD},${T}!$B:$B,"<="&$${lastCol}$${PC_HEAD})`,
+        `=C${r}-D${r}`]
+        .concat(days.map((d) => plan[c.name.toLowerCase() + '|' + c.type + '|' + d] || ''));
+    });
+    if (n) {
+      sh.getRange(PC_FIRST, 1, n, 2).setValues(rows.map((r) => r.slice(0, 2)));
+      sh.getRange(PC_FIRST, 3, n, 3).setFormulas(rows.map((r) => r.slice(2, 5).map(F)));
+      sh.getRange(PC_FIRST, PC_DAY_COL, n, days.length).setValues(rows.map((r) => r.slice(5)));
+      sh.getRange(PC_FIRST, PC_DAY_COL, n, days.length).setBackground('#E3F2FD');
+    }
+    sh.getRange(PC_HEAD + 1, 3, n + 2, head.length - 2).setNumberFormat('#,##0;-#,##0;""');
+
+    // Подсветка
+    const grid = sh.getRange(PC_FIRST, PC_DAY_COL, Math.max(n, 1), days.length);
+    const f = `${firstDay}${PC_FIRST}`;
+    const cum = `SUM($${firstDay}${PC_FIRST}:${f})`;
+    const rules = [
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied(F(`=AND(${f}<>"",${cum}<=$D${PC_FIRST})`))
+        .setBackground('#E0E0E0').setFontColor('#9E9E9E').setStrikethrough(true).setRanges([grid]).build(),
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied(F(`=AND(${f}<>"",${cum}-${f}<$D${PC_FIRST},${cum}>$D${PC_FIRST})`))
+        .setBackground('#FFE0B2').setRanges([grid]).build(),
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied(F(`=AND($B${PC_FIRST}="Расход",$E${PC_FIRST}<0)`))
+        .setBackground('#FFCDD2').setFontColor('#B71C1C').setBold(true)
+        .setRanges([sh.getRange(PC_FIRST, 5, Math.max(n, 1), 1)]).build(),
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied(F(`=${firstDay}$${PC_HEAD}=TODAY()`))
+        .setBackground('#FFF59D').setRanges([sh.getRange(PC_HEAD, PC_DAY_COL, 1, days.length)]).build(),
+    ];
+    sh.setConditionalFormatRules(rules);
+
+    sh.setFrozenRows(PC_HEAD + 2);
+    sh.setFrozenColumns(5);
+    sh.setColumnWidth(1, 190);
+    sh.setColumnWidth(2, 60);
+    for (let c = 3; c <= 5; c++) sh.setColumnWidth(c, 85);
+    sh.setColumnWidths(PC_DAY_COL, days.length, 62);
+    sh.getRange(PC_HEAD, 3, 1, 3).setNote('План / Потрачено / Осталось — за весь период со «Свода»');
+  }
+}
+
+/**
+ * Какой разделитель аргументов понимает таблица: формулы из скрипта в русской локали с «,» не разбираются.
+ * Проверяем на пробной формуле, локаль не переключаем: смена локали перезагружает открытую таблицу,
+ * а сетка перестраивается при каждом открытии — получилась бы бесконечная перезагрузка.
+ */
+function formulaDialect_(sh) {
+  const probe = sh.getRange(1, 1);
+  for (const sep of [',', ';']) {
+    probe.setFormula(`=SUM(1${sep}2)`);
+    SpreadsheetApp.flush();
+    const ok = probe.getDisplayValue() === '3';
+    probe.clearContent();
+    if (ok) return sep === ',' ? (f) => f : (f) => f.replace(/,/g, ';');
+  }
+  throw new Error('Не удалось определить разделитель формул');
+}
+
+/**
+ * Правка ячеек сетки: для каждой ячейки удаляет плановые строки «Транзакций» этой категории и дня
+ * и, если в ячейке число, записывает одну новую. Даты берутся из шапки, категория и тип — из колонок A и B.
+ */
+function syncPlanCells_(sh, range) {
+  const ss = sh.getParent();
+  const tz = ss.getSpreadsheetTimeZone();
+  // В простом триггере блокировка может быть недоступна — тогда работаем без неё.
+  let lock = null;
+  try { lock = LockService.getScriptLock(); lock.waitLock(20000); } catch (err) { lock = null; }
+  try {
+    const tx = ss.getSheetByName(SHEET_TX);
+    const r0 = Math.max(range.getRow(), PC_FIRST);
+    const c0 = Math.max(range.getColumn(), PC_DAY_COL);
+    const r1 = range.getLastRow();
+    const c1 = range.getLastColumn();
+    const dates = sh.getRange(PC_HEAD, c0, 1, c1 - c0 + 1).getValues()[0];
+    const cats = sh.getRange(r0, 1, r1 - r0 + 1, 2).getValues();
+    const vals = sh.getRange(r0, c0, r1 - r0 + 1, c1 - c0 + 1).getValues();
+
+    const wanted = {};   // ключ «категория|тип|дата» → сумма (0 — удалить)
+    cats.forEach((c, i) => {
+      if (!c[0]) return;
+      dates.forEach((d, j) => {
+        if (!isDate_(d)) return;
+        const v = Math.round(num_(vals[i][j]));
+        wanted[String(c[0]).toLowerCase() + '|' + (c[1] || 'Расход') + '|' + ymd_(d, tz)] =
+          { name: String(c[0]), type: c[1] || 'Расход', date: ymd_(d, tz), amount: v > 0 ? v : 0 };
+      });
+    });
+
+    // Удаляем старые планы этих ячеек снизу вверх
+    const rows = readTx_(ss);
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const t = txObj_(rows[i].v, tz);
+      if (t.status !== 'План') continue;
+      if (wanted[String(t.category).toLowerCase() + '|' + t.type + '|' + t.date]) tx.deleteRow(rows[i].row);
+    }
+    // Пишем новые
+    const add = Object.values(wanted).filter((w) => w.amount > 0).map((w) => [
+      'g-' + Utilities.getUuid().slice(0, 12), parseYmd_(w.date), 'План', w.type, w.amount, w.name,
+      '', '', 'из «Календаря план»', new Date(), '']);
+    if (add.length) tx.getRange(tx.getLastRow() + 1, 1, add.length, add[0].length).setValues(add);
+  } finally {
+    if (lock) lock.releaseLock();
+  }
+}
+
+function colLetter_(n) {
+  let s = '';
+  for (; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s;
+  return s;
 }
 
 // ---------- Проверка из редактора ----------

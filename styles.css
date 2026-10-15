@@ -196,6 +196,41 @@ h2 { font-size: 15px; color: var(--muted); font-weight: 600; margin: 14px 0 0; }
 }
 .edit-bar button { border: 0; background: rgba(255,255,255,.2); color: #fff; border-radius: 9px; padding: 8px 14px; }
 
+/* ---------- прогноз, конверты, лента ---------- */
+.forecast { background: var(--card); border-radius: var(--radius); padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.forecast .f-title { color: var(--muted); font-size: 13px; }
+.forecast .f-row { display: flex; justify-content: space-between; gap: 8px; }
+.forecast .f-row b { font-variant-numeric: tabular-nums; }
+.forecast .verdict { font-weight: 700; padding-top: 4px; border-top: 1px solid var(--line); }
+.forecast .verdict.ok { color: var(--income); }
+.forecast .verdict.bad { color: var(--danger); }
+.section-toggle { border: 0; background: none; color: var(--muted); font-weight: 600; font-size: 15px; text-align: left; padding: 10px 0 0; display: flex; justify-content: space-between; }
+.section-toggle[aria-expanded=true] span { display: inline-block; transform: rotate(180deg); }
+.list li.env { flex-direction: column; align-items: stretch; gap: 6px; }
+.list li.env .env-top { display: flex; justify-content: space-between; gap: 8px; }
+.list li.env .env-top small { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.list li.env .bar { height: 6px; background: var(--chip); border-radius: 3px; overflow: hidden; }
+.list li.env .bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+.list li.env.warn .bar i { background: var(--warn); }
+.list li.env.over .bar i { background: var(--danger); }
+.list li.env.over .env-top small, .list li.env.unplanned .env-top small { color: var(--danger); }
+.list li.env.mandatory { opacity: .75; }
+.feed-seg { align-self: center; margin-top: 4px; }
+#today-card { margin-top: 6px; }
+
+/* ---------- отчёт ---------- */
+#report-body { display: flex; flex-direction: column; gap: 10px; padding-bottom: 20px; }
+#report-body h2 { margin: 10px 0 0; }
+.rep-table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: var(--radius); overflow: hidden; font-size: 14px; }
+.rep-table th, .rep-table td { padding: 8px 10px; border-top: 1px solid var(--line); text-align: right; font-variant-numeric: tabular-nums; }
+.rep-table th { color: var(--muted); font-weight: 600; font-size: 12px; border-top: 0; }
+.rep-table td:first-child, .rep-table th:first-child { text-align: left; }
+.rep-table td:not(:first-child) { white-space: nowrap; }
+.rep-table tr.total td { font-weight: 700; }
+.rep-table tr.sub td:first-child { padding-left: 22px; color: var(--muted); }
+.rep-table td.over { color: var(--danger); font-weight: 600; }
+.rep-table td.ok { color: var(--income); }
+
 /* ---------- лист категорий ---------- */
 .sheet { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: flex-end; z-index: 10; }
 .sheet-body {

@@ -68,6 +68,7 @@ window.addEventListener('popstate', (e) => {
   if (!s.sub && (state.editing || state.fromPlan)) resetEntry();   // ушли из режима правки без сохранения
   show(s.screen);
   if (s.screen === 'summary') renderSummary();
+  if (s.screen === 'report') renderReport();
   // Выбор в листе делается после того, как лист закрылся: иначе два history.back() подряд.
   const after = state.afterSheet;
   state.afterSheet = null;
@@ -249,7 +250,10 @@ function save(account) {
   const amount = Number(state.amount);
   const isT = state.type === TRANSFER;
   // Факт расхода/дохода: счёт выбирается в листе после «Записать». План и перевод — без листа.
-  if (!isT && !state.plan && account === undefined) return openAccountSheet();
+  if (!isT && !state.plan && account === undefined) {
+    if (!state.editing && !confirmNotDuplicate(amount)) return;
+    return openAccountSheet();
+  }
   const fields = isT ? {
     date: $('date').value || todayYmd(),
     status: 'Факт',
@@ -360,6 +364,17 @@ function openCategorySheet() {
   $('cat-sheet').hidden = false;
   history.pushState(Object.assign({}, currentNav(), { sheet: true }), '');
 }
+/** Та же сумма в той же категории за ±3 дня — спросить, не дубль ли это. */
+function confirmNotDuplicate(amount) {
+  const date = $('date').value || todayYmd();
+  const dayNum = (s) => Date.UTC(...s.split('-').map((x, i) => Number(x) - (i === 1 ? 1 : 0)));
+  const same = feedData().facts.find((t) => t.type === state.type && t.category === state.category &&
+    Math.round(t.amount) === Math.round(amount) && Math.abs(dayNum(t.date) - dayNum(date)) <= 3 * 864e5);
+  if (!same) return true;
+  return confirm(`Похожая запись уже есть: ${money(same.amount)} · ${same.category} · ${shortDate(same.date)}` +
+    `${same.who ? ' (' + same.who + ')' : ''}.\nВсё равно записать?`);
+}
+
 function openAccountSheet() {
   const list = $('acc-list');
   list.innerHTML = '';
@@ -426,6 +441,8 @@ function renderSummary() {
   renderBalances();
   $('s-days').textContent = sm.daysLeft != null ? sm.daysLeft : '—';
   renderStamp();
+  renderForecast();
+  renderEnvelopes();
   renderDays();
 }
 
@@ -565,8 +582,60 @@ function feedData() {
   return { plans: plans, facts: facts };
 }
 
+/** Прогноз до конца периода — считается на «Своде», здесь только показ. */
+function renderForecast() {
+  const sm = (state.snap && state.snap.summary) || {};
+  const box = $('forecast');
+  if (sm.lifeMoney == null || sm.lifeMoney === '') { box.hidden = true; return; }
+  box.hidden = false;
+  const gap = Number(sm.forecastGap) || 0;
+  const ok = gap >= 0;
+  const runOut = sm.runOutDate ? shortDate(sm.runOutDate) : '';
+  box.innerHTML = '';
+  const add = (cls, html) => { const d = document.createElement('div'); d.className = cls; d.innerHTML = html; box.appendChild(d); };
+  add('f-title', `До ${sm.payday ? shortDate(sm.payday) : 'конца периода'} · ${sm.daysLeft} дн. · на жизнь ${money(sm.lifeMoney)}`);
+  add('f-row', `<span>Можно тратить в день</span><b>${money(sm.dailyBudget)}</b>`);
+  add('f-row', `<span>Тратите сейчас (за 7 дней)</span><b>${money(sm.pace7)}</b>`);
+  add('verdict ' + (ok ? 'ok' : 'bad'), ok
+    ? `Хватит до ${sm.payday ? shortDate(sm.payday) : 'конца периода'}, запас ≈ ${money(gap)}`
+    : `Не хватит ≈ ${money(-gap)}${runOut ? ' · деньги закончатся ~' + runOut : ''}`);
+}
+
+/** Конверты: план и факт по статьям расходов за период («Свод»). */
+function renderEnvelopes() {
+  const open = !!LS.get('showEnvelopes', false);
+  $('env-toggle').setAttribute('aria-expanded', String(open));
+  $('envelopes').hidden = !open;
+  if (!open) return;
+  const ul = $('envelopes');
+  ul.innerHTML = '';
+  const days = Number((state.snap && state.snap.summary && state.snap.summary.daysLeft) || 1);
+  const rows = ((state.snap && state.snap.categoryTable) || [])
+    .filter((c) => c.type === 'Расход' && (c.plan > 0 || c.fact > 0))
+    .map((c) => Object.assign({ ratio: c.plan ? c.fact / c.plan : Infinity }, c))
+    .sort((a, b) => (a.mandatory - b.mandatory) || (b.ratio - a.ratio) || (b.fact - a.fact));
+  if (!rows.length) return emptyRow(ul, 'Нет данных — обнови Apps Script и запусти migrateV4');
+  for (const c of rows) {
+    const li = document.createElement('li');
+    const unplanned = !c.plan;
+    // Отложить больше плана — не перерасход
+    const over = c.plan && c.fact > c.plan && c.name !== 'Сбережения';
+    li.className = 'env' + (c.mandatory ? ' mandatory' : '') + (unplanned ? ' unplanned' : over ? ' over' : c.ratio > 0.85 ? ' warn' : '');
+    const left = c.plan - c.fact;
+    const note = unplanned ? `вне плана ${money(c.fact)}`
+      : over ? `перерасход ${money(-left)}`
+        : left < 0 ? `сверх плана ${money(-left)}`
+        : `осталось ${money(left)}${c.mandatory ? '' : ' · ≈' + money(left / days) + '/день'}`;
+    li.innerHTML = '<div class="env-top"><span></span><small></small></div><div class="bar"><i></i></div>';
+    li.querySelector('span').textContent = c.name + (c.plan ? ` · ${money(c.fact)} из ${money(c.plan)}` : '');
+    li.querySelector('small').textContent = note;
+    li.querySelector('.bar i').style.width = (unplanned ? 100 : Math.min(100, c.ratio * 100)) + '%';
+    ul.appendChild(li);
+  }
+}
+
 /**
- * Лента по дням: сегодня сверху, дальше будущие дни, прошедшие — ниже.
+ * Лента по дням: «Сегодня» всегда сверху, под ним переключатель «Прошедшие · Предстоящие».
  * В дне: планы, разделитель, факты, остаток плана (план расходов − факт расходов за день).
  */
 function renderDays() {
@@ -580,17 +649,151 @@ function renderDays() {
   facts.forEach((t) => day(t.date).facts.push(t));
   day(today);
 
-  const dates = Object.keys(days);
-  const future = dates.filter((d) => d >= today).sort();
-  const past = dates.filter((d) => d < today).sort().reverse();
+  $('today-card').innerHTML = '';
+  $('today-card').appendChild(dayCard(today, days[today]));
 
-  future.forEach((d) => box.appendChild(dayCard(d, days[d])));
-  if (past.length) {
-    const h = document.createElement('h2');
-    h.textContent = 'Прошедшие дни';
-    box.appendChild(h);
-    past.forEach((d) => box.appendChild(dayCard(d, days[d])));
+  const tab = LS.get('feedTab', 'past');
+  for (const b of $('feed-seg').children) b.classList.toggle('on', b.dataset.v === tab);
+  const dates = Object.keys(days).filter((d) => d !== today);
+  const list = tab === 'past'
+    ? dates.filter((d) => d < today).sort().reverse()
+    : dates.filter((d) => d > today).sort();
+  if (!list.length) {
+    const ul = document.createElement('ul');
+    ul.className = 'list';
+    emptyRow(ul, tab === 'past' ? 'Прошедших дней пока нет' : 'Впереди ничего не запланировано');
+    box.appendChild(ul);
   }
+  list.forEach((d) => box.appendChild(dayCard(d, days[d])));
+}
+
+// ---------- отчёт ----------
+function openReport() {
+  go('report');
+  renderReport();
+}
+
+/** Отчёт за период: итоги, план/факт по статьям, вне плана, недели, крупные траты, кто сколько. */
+function renderReport() {
+  const box = $('report-body');
+  box.innerHTML = '';
+  const snap = state.snap || {};
+  const sm = snap.summary || {};
+  const table = snap.categoryTable || [];
+  if (!table.length) {
+    box.innerHTML = '<p class="hint">Нет данных — обнови Apps Script и запусти migrateV4</p>';
+    return;
+  }
+  const mand = {};
+  table.forEach((c) => { mand[c.name + '|' + c.type] = c.mandatory; });
+  const start = sm.periodStart || todayYmd();
+  const today = todayYmd();
+  const facts = feedData().facts.filter((t) => t.date >= start && t.date <= today);
+  const sum = (arr, f) => arr.reduce((s, x) => s + (f ? f(x) : x), 0);
+  const h = (text) => { const e = document.createElement('h2'); e.textContent = text; box.appendChild(e); };
+  const tbl = (head, rows) => {
+    const t = document.createElement('table');
+    t.className = 'rep-table';
+    const esc = (v) => String(v).replace(/[&<>]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+    t.innerHTML = (head ? '<tr>' + head.map((x) => `<th>${esc(x)}</th>`).join('') + '</tr>' : '') +
+      rows.map((r) => `<tr class="${r.cls || ''}">` +
+        r.cells.map((x, i) => `<td class="${(r.tdCls && r.tdCls[i]) || ''}">${esc(x)}</td>`).join('') + '</tr>').join('');
+    box.appendChild(t);
+  };
+
+  // Шапка и итоги
+  const passed = Math.round((Date.parse(today) - Date.parse(start)) / 864e5) + 1;
+  const total = passed + Number(sm.daysLeft || 1) - 1;
+  const p = document.createElement('p');
+  p.className = 'hint';
+  p.textContent = `Период ${shortDate(start)} – ${sm.periodEnd ? shortDate(sm.periodEnd) : ''} · прошло ${passed} из ${total} дней`;
+  box.appendChild(p);
+
+  const inc = table.filter((c) => c.type === 'Доход');
+  const exp = table.filter((c) => c.type === 'Расход');
+  const savings = sum(exp.filter((c) => c.name === 'Сбережения'), (c) => c.fact);
+  const mandatory = sum(exp.filter((c) => c.mandatory && c.name !== 'Сбережения'), (c) => c.fact);
+  const variable = sum(exp.filter((c) => !c.mandatory), (c) => c.fact);
+  h('Итоги');
+  tbl(null, [
+    { cells: ['Доходы', money(sum(inc, (c) => c.fact))], cls: 'total' },
+    { cells: ['Расходы', money(sum(exp, (c) => c.fact))], cls: 'total' },
+    { cells: ['обязательные', money(mandatory)], cls: 'sub' },
+    { cells: ['в накопления', money(savings)], cls: 'sub' },
+    { cells: ['остальные', money(variable)], cls: 'sub' },
+    { cells: ['На счетах сейчас', money(sm.balanceNow)], cls: 'total' },
+  ]);
+
+  // Прогноз
+  if (sm.lifeMoney != null && sm.lifeMoney !== '') {
+    const gap = Number(sm.forecastGap) || 0;
+    h('Прогноз до конца периода');
+    tbl(null, [
+      { cells: ['Деньги на жизнь', money(sm.lifeMoney)] },
+      { cells: ['Можно тратить в день', money(sm.dailyBudget)] },
+      { cells: ['Тратите сейчас (7 дней)', money(sm.pace7)] },
+      { cells: [gap >= 0 ? 'Запас к концу периода' : 'Нехватка к концу периода', money(Math.abs(gap))],
+        tdCls: [null, gap >= 0 ? 'ok' : 'over'], cls: 'total' },
+    ]);
+  }
+
+  // План и факт по статьям
+  h('Расходы: план и факт');
+  const rows = exp.filter((c) => c.plan || c.fact).sort((a, b) => b.fact - a.fact).map((c) => {
+    const pct = c.plan ? Math.round(c.fact / c.plan * 100) + '%' : 'вне плана';
+    const bad = !c.plan || (c.fact > c.plan && c.name !== 'Сбережения');
+    return { cells: [c.name, c.plan ? money(c.plan) : '—', money(c.fact), pct], tdCls: [null, null, null, bad ? 'over' : ''] };
+  });
+  rows.push({ cells: ['Итого', money(sum(exp, (c) => c.plan)), money(sum(exp, (c) => c.fact)), ''], cls: 'total' });
+  tbl(['Статья', 'План', 'Факт', '%'], rows);
+  const unplanned = sum(exp.filter((c) => !c.plan), (c) => c.fact);
+  if (unplanned) {
+    const q = document.createElement('p');
+    q.className = 'hint';
+    q.textContent = `Траты вне плана: ${money(unplanned)}`;
+    box.appendChild(q);
+  }
+
+  h('Доходы: план и факт');
+  tbl(['Источник', 'План', 'Факт'], inc.filter((c) => c.plan || c.fact).sort((a, b) => b.fact - a.fact)
+    .map((c) => ({ cells: [c.name, c.plan ? money(c.plan) : '—', money(c.fact)] })));
+
+  // Динамика по неделям: необязательные расходы
+  const varFacts = facts.filter((t) => t.type === 'Расход' && !mand[t.category + '|' + t.type]);
+  const weeks = {};
+  varFacts.forEach((t) => {
+    const w = Math.floor((Date.parse(t.date) - Date.parse(start)) / (7 * 864e5));
+    weeks[w] = (weeks[w] || 0) + t.amount;
+  });
+  const wrows = Object.keys(weeks).map(Number).sort((a, b) => a - b).map((w) => {
+    const from = new Date(Date.parse(start) + w * 7 * 864e5).toISOString().slice(0, 10);
+    const toMs = Math.min(Date.parse(from) + 6 * 864e5, Date.parse(today));
+    const to = new Date(toMs).toISOString().slice(0, 10);
+    const n = Math.round((toMs - Date.parse(from)) / 864e5) + 1;
+    return { cells: [`${shortDate(from)}–${shortDate(to)}`, money(weeks[w]), money(weeks[w] / n)] };
+  });
+  if (wrows.length) {
+    h('Динамика: необязательные траты');
+    tbl(['Неделя', 'Сумма', 'В день'], wrows);
+  }
+
+  // Крупные разовые траты
+  const big = varFacts.filter((t) => t.amount >= 10000).sort((a, b) => b.amount - a.amount);
+  if (big.length) {
+    h('Крупные траты (от 10 000)');
+    tbl(null, big.map((t) => ({ cells: [`${shortDate(t.date)} · ${t.category}${t.comment ? ' · ' + t.comment : ''}`, money(t.amount)] })));
+  }
+
+  // Кто сколько потратил
+  const who = {};
+  facts.filter((t) => t.type === 'Расход').forEach((t) => {
+    const k = t.who || '—';
+    who[k] = who[k] || { all: 0, v: 0 };
+    who[k].all += t.amount;
+    if (!mand[t.category + '|' + t.type]) who[k].v += t.amount;
+  });
+  h('Кто сколько потратил');
+  tbl(['', 'Всего', 'Необязательные'], Object.keys(who).map((k) => ({ cells: [k, money(who[k].all), money(who[k].v)] })));
 }
 
 function dayCard(date, g) {
@@ -747,6 +950,15 @@ function bind() {
   $('to-account').addEventListener('change', renderEntry);
   $('balance-toggle').onclick = () => { LS.set('showBalances', !LS.get('showBalances', false)); renderBalances(); };
   $('transfer-btn').onclick = openTransfer;
+  $('env-toggle').onclick = () => { LS.set('showEnvelopes', !LS.get('showEnvelopes', false)); renderEnvelopes(); };
+  $('feed-seg').addEventListener('click', (e) => {
+    const v = e.target.dataset.v;
+    if (!v) return;
+    LS.set('feedTab', v);
+    renderDays();
+  });
+  $('report-btn').onclick = openReport;
+  $('report-back').onclick = () => history.back();
   $('plan-toggle').onclick = () => { state.plan = !state.plan; renderEntry(); };
   $('date').addEventListener('change', renderEntry);
   $('comment').addEventListener('keydown', (e) => { if (e.key === 'Enter') e.target.blur(); });

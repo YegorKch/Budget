@@ -114,8 +114,29 @@
       <ul class="list" id="balance-history"></ul>
     </div>
 
+    <div class="forecast" id="forecast" hidden></div>
+
+    <button type="button" class="section-toggle" id="env-toggle" aria-expanded="false">Конверты: план и факт по статьям <span>▾</span></button>
+    <ul class="list" id="envelopes" hidden></ul>
+
+    <div id="today-card"></div>
+    <div class="seg feed-seg" id="feed-seg">
+      <button type="button" data-v="past">Прошедшие</button>
+      <button type="button" data-v="future">Предстоящие</button>
+    </div>
     <div id="days"></div>
     <p class="hint">Тап по плану — оплатить, по факту — изменить, ✕ — удалить</p>
+    <button class="primary ghost-primary" id="report-btn" type="button">Отчёт за период</button>
+  </section>
+
+  <!-- Отчёт -->
+  <section id="report" class="screen" hidden>
+    <header class="topbar">
+      <button class="icon" id="report-back" type="button" aria-label="Назад к сводке">←</button>
+      <b>Отчёт за период</b>
+      <span style="width:44px"></span>
+    </header>
+    <div id="report-body"></div>
   </section>
 
   <!-- Выбор категории -->
