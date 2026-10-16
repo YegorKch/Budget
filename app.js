@@ -597,7 +597,11 @@ function renderForecast() {
   const until = sm.nextIncomeFrom && sm.periodEnd
     ? `до зарплаты ${shortDate(sm.nextIncomeFrom)}–${shortDate(sm.periodEnd)}`
     : `до ${sm.payday ? shortDate(sm.payday) : 'конца периода'}`;
-  add('f-title', `Еда, такси, транспорт · ${until} · ${sm.daysLeft} дн. · есть ${money(sm.lifeMoney)}`);
+  // Подпись — из статей, которые сейчас помечены «Ежедневная» в «Справочниках»
+  const dailyNames = ((state.snap && state.snap.categoryTable) || [])
+    .filter((c) => c.daily && c.type === 'Расход').map((c) => c.name);
+  const what = dailyNames.length ? dailyNames.join(', ') : 'Ежедневное';
+  add('f-title', `${what} · ${until} · ${sm.daysLeft} дн. · есть ${money(sm.lifeMoney)}`);
   add('f-row', `<span>Можно тратить в день</span><b>${money(sm.dailyBudget)}</b>`);
   add('f-row', `<span>Тратите сейчас (за 7 дней)</span><b>${money(sm.pace7)}</b>`);
   add('verdict ' + (ok ? 'ok' : 'bad'), ok

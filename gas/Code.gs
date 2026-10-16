@@ -46,6 +46,9 @@ const DAILY_DEFAULT = ['Поесть', 'Такси', 'Общественный �
 const GUARANTEED = 'Гарантировано';
 const EXPECTED = 'Ожидается';
 const GUARANTEED_DEFAULT = ['Зп', 'Стипендия', 'Пособие'];
+// «Справочники», колонка H «Переносить»: какие статьи «Перенести план с прошлого периода» копирует.
+// По умолчанию — обязательные, ежедневные и гарантированные доходы (регулярное), разовое не переносится.
+const CARRY = 'да';
 // Окно зарплаты в конце периода (с 5-го по 10-е): гарантированные доходы и обязательные платежи, что приходятся
 // на эти дни, — уже следующий период (следующая зарплата, рассрочки с неё). Прогноз текущего их не учитывает.
 const NEXT_INCOME_DAYS = SALARY_DAY_TO - SALARY_DAY_FROM + 1;
@@ -1018,6 +1021,17 @@ function migrateV5() {
       ref.setColumnWidth(7, 120);
       log.push('Справочники: колонка «Надёжность»');
     }
+    if (ref.getRange('H1').getValue() !== 'Переносить') {
+      ref.getRange('H1').setValue('Переносить');
+      ref.getRange('A1').copyFormatToRange(ref, 8, 8, 1, 1);
+      const n = Math.max(ref.getLastRow() - 1, 1);
+      const v = ref.getRange(2, 1, n, 7).getValues();
+      ref.getRange(2, 8, n, 1).setValues(v.map((r) => [r[0] && (r[2] === 'да' || r[4] === 'да' || r[6] === GUARANTEED) ? CARRY : '']));
+      ref.getRange(2, 8, Math.min(ref.getMaxRows() - 1, 499), 1).setDataValidation(
+        SpreadsheetApp.newDataValidation().requireValueInList([CARRY], true).setAllowInvalid(true).build());
+      ref.setColumnWidth(8, 100);
+      log.push('Справочники: колонка «Переносить»');
+    }
     writeCategoryTableFormulas_(sv);
     writeForecastFormulas_(sv);
     SpreadsheetApp.flush();
@@ -1170,6 +1184,7 @@ function trimArchive_(ss, newStart) {
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('Бюджет')
     .addItem('Обновить Календарь план', 'rebuildPlanCalendar')
+    .addItem('Перенести план с прошлого периода', 'copyPlanFromPrevious')
     .addToUi();
   try { ensurePeriod_(SpreadsheetApp.getActive()); } catch (err) { /* не мешаем открыть таблицу */ }
   try { rebuildPlanCalendar(); } catch (err) { /* не мешаем открыть таблицу */ }
@@ -1258,7 +1273,8 @@ function rebuildPlanCalendar() {
       '«Надёжность» у доходов: «Гарантировано» входит в прогноз, «Ожидается» — нет.').setFontStyle('italic').setFontColor('#777777');
 
     // Шапка
-    const head = ['Категория', 'Тип', 'План', 'Потрачено', 'Осталось', 'Пометка'].concat(days.map((d) => parseYmd_(d)));
+    const head = ['Категория', 'Тип', 'План', 'Потрачено / пришло', 'Осталось / ещё придёт', 'Пометка']
+      .concat(days.map((d) => parseYmd_(d)));
     sh.getRange(PC_HEAD, 1, 1, head.length).setValues([head])
       .setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#37474F').setHorizontalAlignment('center');
     sh.getRange(PC_HEAD, PC_DAY_COL, 1, days.length).setNumberFormat('dd.mm');
@@ -1287,7 +1303,8 @@ function rebuildPlanCalendar() {
         `=SUM(${firstDay}${r}:${lastCol}${r})`,
         `=SUMIFS(${T}!$E:$E,${T}!$F:$F,$A${r},${T}!$D:$D,$B${r},${T}!$C:$C,"Факт",` +
         `${T}!$B:$B,">="&$${firstDay}$${PC_HEAD},${T}!$B:$B,"<="&($${lastCol}$${PC_HEAD}-${c.shift}))`,
-        `=C${r}-D${r}`, c.rel]
+        // У доходов — сколько из плана ещё не пришло (пришло больше — пусто, а не минус)
+        c.type === 'Доход' ? `=MAX(0,C${r}-D${r})` : `=C${r}-D${r}`, c.rel]
         .concat(days.map((d) => plan[c.name.toLowerCase() + '|' + c.type + '|' + d] || ''));
     });
     if (n) {
@@ -1361,7 +1378,10 @@ function rebuildPlanCalendar() {
     for (let c = 3; c <= 5; c++) sh.setColumnWidth(c, 85);
     sh.setColumnWidth(PC_REL_COL, 115);
     sh.setColumnWidths(PC_DAY_COL, days.length, 62);
-    sh.getRange(PC_HEAD, 3, 1, 3).setNote('План / Потрачено / Осталось — за весь период со «Свода»');
+    sh.getRange(PC_HEAD, 3, 1, 3).setNote('За весь период. У расходов: потрачено и сколько осталось (минус — перерасход). ' +
+      'У доходов: сколько пришло и сколько ещё придёт по плану.');
+    sh.setRowHeight(PC_HEAD, 34);
+    sh.getRange(PC_HEAD, 1, 1, PC_REL_COL).setWrap(true);
   }
 }
 
@@ -1428,6 +1448,101 @@ function syncPlanCells_(sh, range) {
   } finally {
     if (lock) lock.releaseLock();
   }
+}
+
+/**
+ * «Бюджет → Перенести план с прошлого периода». Мягко: занятые ячейки (уже есть план на этот день по этой статье)
+ * не трогает — можно сначала вписать новое, а регулярное добрать автоматом. Переносятся статьи с «да»
+ * в «Справочниках», колонка H «Переносить». Ежедневные — по дням недели, остальные — на то же число через месяц.
+ */
+function copyPlanFromPrevious() {
+  const ss = SpreadsheetApp.getActive();
+  const tz = ss.getSpreadsheetTimeZone();
+  const sv = ss.getSheetByName(SHEET_SUMMARY);
+  const S = ymd_(sv.getRange(summaryKeyRow_(sv, 'periodStart'), 2).getValue(), tz);
+  const E = ymd_(sv.getRange(summaryKeyRow_(sv, 'periodEnd'), 2).getValue(), tz);
+
+  // Прошлый период — из «Архива» (блок, закончившийся накануне начала текущего); нет — месяц назад
+  const prevEnd = addDays_(S, -1);
+  let prevStart = addMonths_(S, -1);
+  const arch = ss.getSheetByName(SHEET_ARCHIVE);
+  if (arch && arch.getLastRow() > 1) {
+    const hit = arch.getRange(2, 2, arch.getLastRow() - 1, 2).getValues()
+      .find((r) => isDate_(r[0]) && isDate_(r[1]) && ymd_(r[1], tz) === prevEnd);
+    if (hit) prevStart = ymd_(hit[0], tz);
+  }
+
+  // Какие статьи переносить и какие из них ежедневные
+  const ref = ss.getSheetByName(SHEET_REF);
+  const refv = ref.getRange(2, 1, Math.max(ref.getLastRow() - 1, 1), 8).getValues().filter((r) => r[0]);
+  const carry = {};
+  refv.forEach((r) => {
+    if (r[7] === CARRY) carry[String(r[0]).trim().toLowerCase() + '|' + (r[1] || 'Расход')] = { daily: r[4] === 'да' };
+  });
+
+  // Планы: источник (прошлый период) и занятые ячейки текущего
+  const src = {};
+  const busy = new Set();
+  const names = {};
+  readTx_(ss).forEach((x) => {
+    const t = txObj_(x.v, tz);
+    if (t.status !== 'План' || t.type === TRANSFER) return;
+    const k = String(t.category).trim().toLowerCase() + '|' + t.type;
+    if (t.date >= S && t.date <= E) busy.add(k + '|' + t.date);
+    if (!carry[k] || t.date < prevStart || t.date > prevEnd) return;
+    names[k] = String(t.category).trim();
+    (src[k] = src[k] || {})[t.date] = (src[k][t.date] || 0) + t.amount;
+  });
+
+  const want = {};   // «статья|тип|дата» → сумма
+  let skipped = 0;
+  Object.keys(src).forEach((k) => {
+    if (carry[k].daily) {
+      // Ежедневные — по дням недели: для каждого дня периода берём тот же день недели из прошлого периода
+      for (let t = S; t <= E; t = addDays_(t, 1)) {
+        for (let w = 1; w <= 9; w++) {
+          const s = addDays_(t, -7 * w);
+          if (s < prevStart) break;
+          if (s <= prevEnd && src[k][s]) {
+            if (busy.has(k + '|' + t)) skipped++;
+            else want[k + '|' + t] = src[k][s];
+            break;
+          }
+        }
+      }
+    } else {
+      // Остальное — на то же число следующего месяца
+      Object.keys(src[k]).forEach((s) => {
+        const t = addMonths_(s, 1);
+        if (t < S || t > E) return;
+        if (busy.has(k + '|' + t)) { skipped++; return; }
+        want[k + '|' + t] = (want[k + '|' + t] || 0) + src[k][s];
+      });
+    }
+  });
+
+  const tx = ss.getSheetByName(SHEET_TX);
+  const now = new Date();
+  const rows = Object.keys(want).map((key) => {
+    const [k1, type, date] = key.split('|');
+    const k = k1 + '|' + type;
+    return ['g-' + Utilities.getUuid().slice(0, 12), parseYmd_(date), 'План', type, Math.round(want[key]), names[k],
+      '', '', 'перенесено с прошлого периода', now, ''];
+  });
+  if (rows.length) tx.getRange(tx.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+  SpreadsheetApp.flush();
+  rebuildPlanCalendar();
+
+  const msg = `Перенесено планов: ${rows.length}. Пропущено занятых ячеек: ${skipped}.` +
+    (Object.keys(src).length ? '' : `\nВ прошлом периоде (${prevStart} – ${prevEnd}) не нашлось планов по статьям с «да» в колонке «Переносить».`);
+  try { SpreadsheetApp.getUi().alert('Перенос плана', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (err) { Logger.log(msg); }
+}
+
+/** Та же дата через n месяцев; если такого числа нет (31-е) — последний день месяца. */
+function addMonths_(s, n) {
+  const [y, m, d] = String(s).split('-').map(Number);
+  const last = new Date(Date.UTC(y, m - 1 + n + 1, 0)).getUTCDate();
+  return new Date(Date.UTC(y, m - 1 + n, Math.min(d, last))).toISOString().slice(0, 10);
 }
 
 function colLetter_(n) {
